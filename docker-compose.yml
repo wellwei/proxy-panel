@@ -1,0 +1,28 @@
+# 把面板接到已在跑的 workbuddy2api 网关上。
+#
+# 前置：网关自己要在宿主机跑着，并把 API key 传进来：
+#   WB2A_API_KEY=sk-xxx docker compose up -d
+#
+# 说明：
+#   - 面板只监听 127.0.0.1:8321（同机访问）；要让局域网访问改成 "8321:8321"
+#   - host.docker.internal 让容器能连到宿主机上的网关（Linux 需要 extra_hosts）
+#   - 「新增账号 / 签到 / 实时积分」需要挂载网关目录（见注释掉的两行），
+#     不挂也能用，只是这几个按钮会显示为不可用
+services:
+  panel:
+    build: .
+    image: wb2a-panel:latest
+    container_name: wb2a-panel
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8321:8321"
+    environment:
+      WB2A_BASE: "http://host.docker.internal:7863"
+      WB2A_API_KEY: "${WB2A_API_KEY:?请设置 WB2A_API_KEY 环境变量（网关的 api_key）}"
+      WB2A_PANEL_PORT: "8321"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux 上需要这行
+    # 需要"新增账号/签到/实时积分"时解开（指向宿主机的网关目录）：
+    # volumes:
+    #   - /path/to/wb2a/app:/gw:ro
+    # environment 里再补：WB2A_BIN_DIR=/gw、WB2A_AUTH_DIR=/gw/auths

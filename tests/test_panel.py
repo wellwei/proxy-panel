@@ -1,0 +1,397 @@
+"""wb2a-panel 的单元测试。
+
+只测纯函数与逻辑层（不依赖真实网关），用标准库 unittest —— 保持零依赖。
+    python3 -m unittest discover -s tests -v
+"""
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import panel  # noqa: E402
+
+
+class TestNormalizeListen(unittest.TestCase):
+    """网关 config 的 listen 归一化。"""
+
+    def test_common_forms(self):
+        cases = {
+            ":7863": "http://127.0.0.1:7863",
+            "0.0.0.0:7863": "http://127.0.0.1:7863",
+            "127.0.0.1:7863": "http://127.0.0.1:7863",
+            "localhost:9999": "http://localhost:9999",
+            "": "http://127.0.0.1:7863",
+        }
+        for listen, want in cases.items():
+            self.assertEqual(panel.normalize_listen(listen), want, listen)
+
+    def test_wildcard_hosts_collapse_to_loopback(self):
+        # 通配地址不能拿去发请求：往 0.0.0.0 / :: 发请求在部分平台直接失败
+        for listen in (":7863", "0.0.0.0:7863", "[::]:7863", "::"):
+            self.assertEqual(panel.normalize_listen(listen), "http://127.0.0.1:7863", listen)
+
+    def test_missing_port_falls_back(self):
+        self.assertEqual(panel.normalize_listen("127.0.0.1"), "http://127.0.0.1:7863")
+
+
+class TestFindGatewayConfig(unittest.TestCase):
+    """网关配置探测：要能认出"这是网关配置"，并跳过无关的 config.json。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_finds_config_in_cwd(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"listen": ":7863", "api_key": "k"}), encoding="utf-8")
+        old = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertTrue(panel.find_gateway_config())
+        finally:
+            os.chdir(old)
+
+    def test_ignores_unrelated_config_json(self):
+        """面板自己的 config.json 没有 listen/api_key，不该被当成网关配置。"""
+        (self.root / "config.json").write_text(
+            json.dumps({"port": 8321, "base": "http://x"}), encoding="utf-8")
+        old = os.getcwd()
+        os.chdir(self.root)
+        try:
+            found = panel.find_gateway_config()
+            self.assertFalse(found and Path(found).parent == self.root)
+        finally:
+            os.chdir(old)
+
+    def test_explicit_path_respected(self):
+        p = self.root / "gw.json"
+        p.write_text(json.dumps({"listen": ":1"}), encoding="utf-8")
+        self.assertEqual(panel.find_gateway_config(str(p)), str(p))
+
+    def test_missing_explicit_path_returns_empty(self):
+        self.assertEqual(panel.find_gateway_config(str(self.root / "nope.json")), "")
+
+
+class TestConfigCapabilities(unittest.TestCase):
+    """能力探测：没有 CLI 工具时必须干净地降级，而不是报错。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch_exec(self, name):
+        p = self.bin / name
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o755)
+        return p
+
+    def test_no_tools_all_disabled(self):
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        self.assertFalse(cfg.can_login)
+        self.assertFalse(cfg.can_credit)
+        self.assertFalse(cfg.can_checkin)
+        self.assertFalse(cfg.can_trial)
+
+    def test_tools_detected_by_exec_bit(self):
+        self._touch_exec("login")
+        self._touch_exec("credit")
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        self.assertTrue(cfg.can_login)
+        self.assertTrue(cfg.can_credit)
+        self.assertFalse(cfg.can_checkin)      # 没造这个
+
+    def test_login_requires_auth_dir(self):
+        """有 login 工具但没有 auths 目录 → 不能登录（不知道该往哪写）。"""
+        self._touch_exec("login")
+        cfg = panel.Config("http://x", "k", "", str(self.bin), 8321)
+        self.assertFalse(cfg.can_login)
+
+    def test_no_bin_dir_is_safe(self):
+        cfg = panel.Config("http://x", "k", "/tmp", "", 8321)
+        self.assertFalse(cfg.can_login)
+        self.assertIsNone(cfg.tool("login"))
+
+    def test_non_executable_tool_rejected(self):
+        p = self.bin / "login"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o644)                          # 没有执行位
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        self.assertFalse(cfg.can_login)
+
+
+class TestExposureAndLanGating(unittest.TestCase):
+    """默认只绑回环；局域网地址只在面板确实可被外部访问时才提示。"""
+
+    def _cfg(self, host):
+        return panel.Config("http://127.0.0.1:7863", "k", "", "", 8321, host=host)
+
+    def test_loopback_is_not_exposed(self):
+        for host in ("127.0.0.1", "localhost", "::1"):
+            self.assertFalse(self._cfg(host).exposed, host)
+
+    def test_other_hosts_are_exposed(self):
+        for host in ("0.0.0.0", "203.0.113.10", "::"):   # RFC 5737 文档保留地址
+            self.assertTrue(self._cfg(host).exposed, host)
+
+    def test_default_is_loopback(self):
+        """不传 host 时必须落在回环上 —— 面板持有网关 api_key，
+        默认开在局域网上等于把管理面敞开。"""
+        cfg = panel.Config("http://x", "k", "", "", 8321)
+        self.assertEqual(cfg.host, "127.0.0.1")
+        self.assertFalse(cfg.exposed)
+
+    def test_lan_address_hidden_when_loopback_only(self):
+        """绑回环时不提示内网地址：它既不可达（误导），也是多余的拓扑信息。"""
+        p = panel.Panel(self._cfg("127.0.0.1"))
+        self.assertEqual(p.endpoint_info()["base_url_lan"], "")
+        self.assertFalse(p.endpoint_info()["panel_exposed"])
+
+    def test_lan_address_shown_when_exposed(self):
+        """绑全网卡时才给内网地址 —— 此时它才是"其他机器该填什么"的可操作信息。"""
+        p = panel.Panel(self._cfg("0.0.0.0"))
+        info = p.endpoint_info()
+        self.assertTrue(info["panel_exposed"])
+        # 取不到出口网卡（如无网络环境）时为空是允许的，能取到就必须是 http:// 开头
+        if info["base_url_lan"]:
+            self.assertTrue(info["base_url_lan"].startswith("http://"))
+
+
+class TestRunTool(unittest.TestCase):
+    """CLI 调用的输出解码。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _script(self, name, body):
+        p = self.bin / name
+        p.write_text("#!/bin/sh\n" + body)
+        p.chmod(0o755)
+
+    def test_non_utf8_output_does_not_crash(self):
+        """签到输出含非 UTF-8 字节：必须用 errors='replace' 解码而不是抛异常。
+
+        这是实测踩过的坑——用 subprocess 的 text=True 会直接 UnicodeDecodeError。
+        """
+        self._script("signin_bin", "printf '\\xff\\xfe ok\\n'\n")
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        p = panel.Panel(cfg)
+        out = p.run_tool("signin_bin")
+        self.assertIn("ok", out["output"])
+
+    def test_missing_tool_degrades_gracefully(self):
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        p = panel.Panel(cfg)
+        out = p.run_tool("signin_bin")
+        self.assertFalse(out["ok"])
+        self.assertIn("未检测到", out["output"])
+
+    def test_nonzero_exit_reported(self):
+        self._script("signin_bin", "echo boom >&2\nexit 3\n")
+        cfg = panel.Config("http://x", "k", "/tmp", str(self.bin), 8321)
+        out = panel.Panel(cfg).run_tool("signin_bin")
+        self.assertFalse(out["ok"])
+        self.assertIn("boom", out["output"])
+
+
+class TestLoginSession(unittest.TestCase):
+    """登录会话状态机：不能并发，取消要能让后台线程退出。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = Path(self.tmp.name)
+        self.auths = Path(self.tmp.name) / "auths"
+        self.auths.mkdir()
+        p = self.bin / "login"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _panel(self):
+        cfg = panel.Config("http://127.0.0.1:1", "k", str(self.auths), str(self.bin), 8321)
+        return panel.Panel(cfg)
+
+    def test_login_disabled_without_capability(self):
+        cfg = panel.Config("http://x", "k", "", "", 8321)
+        r = panel.Panel(cfg).login_start("cn")
+        self.assertIn("error", r)
+        self.assertIn("同机部署", r["error"])
+
+    def test_cancel_bumps_generation(self):
+        """取消要让 gen 前进 —— 后台线程据此发现自己被取代并退出。
+
+        否则被取消的线程会继续 poll，而新会话已覆写同一个 state 文件，
+        它会拿新会话的结果去落盘（写错账号）。
+        """
+        p = self._panel()
+        with p._lock:
+            before = p.session["gen"]
+        p.login_cancel()
+        with p._lock:
+            self.assertGreater(p.session["gen"], before)
+            self.assertEqual(p.session["stage"], "idle")
+
+    def test_worker_exits_when_generation_changes(self):
+        """worker 每轮核对 gen：被取代后立即返回，不写任何东西。"""
+        p = self._panel()
+        with p._lock:
+            gen = p.session["gen"] + 1
+            p.session = {"gen": gen, "stage": "waiting", "message": "", "url": "", "realm": "cn"}
+        p.login_cancel()                     # gen 前进 → worker 应退出
+        done = threading.Event()
+
+        def run():
+            p._login_worker(gen, "cn", "http://example.invalid")
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        # worker 第一轮 sleep 3s 后才核对 gen；给它足够时间
+        self.assertTrue(done.wait(timeout=8), "worker 未在 gen 变化后退出")
+
+
+class TestWriteAuthFile(unittest.TestCase):
+    """凭据落盘：格式要与网关一致，权限 0600，原子写。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "auths").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _panel(self):
+        cfg = panel.Config("http://x", "k", str(self.root / "auths"), "", 8321)
+        return panel.Panel(cfg)
+
+    def test_writes_expected_shape(self):
+        p = self._panel()
+        path = p._write_auth_file({
+            "uid": "u1", "nickname": "nick", "access_token": "at",
+            "refresh_token": "rt", "expires_in": 3600,
+            "domain": "www.codebuddy.cn", "realm": "cn",
+        })
+        self.assertEqual(path.name, "workbuddy-u1.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["account"]["uid"], "u1")
+        self.assertEqual(data["auth"]["accessToken"], "at")
+        self.assertEqual(data["auth"]["realm"], "cn")
+        self.assertGreater(data["auth"]["expiresAt"], 0)
+
+    def test_permissions_are_0600(self):
+        p = self._panel()
+        path = p._write_auth_file({"uid": "u2", "access_token": "at"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_creates_auth_dir_if_missing(self):
+        cfg = panel.Config("http://x", "k", str(self.root / "new" / "auths"), "", 8321)
+        path = panel.Panel(cfg)._write_auth_file({"uid": "u3", "access_token": "at"})
+        self.assertTrue(path.is_file())
+
+
+class TestExtractErrorMessage(unittest.TestCase):
+    """错误消息提取：网关把 message 嵌在 error 对象里，只读顶层会永远拿不到。
+
+    这是实测踩到的坑——两种 404（管理端点未开启 / uid 不存在）曾经分不开。
+    """
+
+    def test_nested_error_object(self):
+        self.assertEqual(
+            panel.extract_error_message(
+                {"error": {"code": "not_found", "message": "account not found: u1"}}),
+            "account not found: u1")
+
+    def test_top_level_message(self):
+        self.assertEqual(panel.extract_error_message({"message": "boom"}), "boom")
+
+    def test_string_error(self):
+        self.assertEqual(panel.extract_error_message({"error": "plain reason"}), "plain reason")
+
+    def test_falls_back_to_code(self):
+        self.assertEqual(panel.extract_error_message({"error": {"code": "not_found"}}), "not_found")
+
+    def test_plain_text(self):
+        self.assertEqual(panel.extract_error_message("just text"), "just text")
+
+    def test_empty(self):
+        self.assertEqual(panel.extract_error_message({}), "")
+
+
+class TestAccountOp(unittest.TestCase):
+    """管理端点的错误映射：连接失败要返回 error 而不是抛异常。"""
+
+    def setUp(self):
+        self.p = panel.Panel(panel.Config("http://127.0.0.1:1", "k", "", "", 8321))
+
+    def test_connection_failure_reported(self):
+        r = self.p.account_op("disable", "u1")
+        self.assertIn("error", r)
+
+
+class TestAccountOp404Split(unittest.TestCase):
+    """两种 404 必须给出不同的、可操作的提示。"""
+
+    def _panel_with_stub(self, payload, code=404):
+        """起一个只回固定响应的迷你服务，验证 account_op 的分支。"""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        cfg = panel.Config("http://127.0.0.1:%d" % srv.server_port, "k", "", "", 8321)
+        return panel.Panel(cfg)
+
+    def test_account_not_found(self):
+        p = self._panel_with_stub(
+            {"error": {"code": "not_found", "message": "account not found: u1"}})
+        r = p.account_op("disable", "u1")
+        self.assertIn("账号不存在", r["error"])
+
+    def test_admin_disabled(self):
+        p = self._panel_with_stub(
+            {"error": {"code": "not_found", "message": "not found"}})
+        r = p.account_op("disable", "u1")
+        self.assertIn("admin", r["error"])
+        self.assertIn("enabled", r["error"])
+
+
+class TestHttpHelper(unittest.TestCase):
+    """http() 的返回契约：连接失败返回 status=0 而不是抛异常。"""
+
+    def test_connection_error_is_status_zero(self):
+        status, body = panel.http("GET", "http://127.0.0.1:1/nope", timeout=3)
+        self.assertEqual(status, 0)
+        self.assertIn("error", body)
+
+
+if __name__ == "__main__":
+    unittest.main()

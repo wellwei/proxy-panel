@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单元测试（Python ${{ matrix.python }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖常见版本：3.8 是不少发行版/容器的默认，3.13 是当前主流
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # 零依赖项目：不需要 pip install，直接跑
+      - name: 语法检查
+        run: python3 -m py_compile panel.py tests/*.py
+      - name: 单元测试（不含冒烟，冒烟单独 job 跑）
+        run: python3 -m unittest tests.test_panel -v
+
+  smoke:
+    name: 冒烟测试（真实启动 + HTTP 通路）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 与本地同源：起 stub 网关 + 面板，走完整 HTTP 流程。
+      # 不在 workflow 里重写一套 curl 断言，避免两处逻辑漂移。
+      - name: 冒烟测试
+        run: python3 -m unittest tests.test_smoke -v

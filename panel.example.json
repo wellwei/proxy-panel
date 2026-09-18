@@ -1,0 +1,8 @@
+{
+  "base": "http://127.0.0.1:7863",
+  "api_key": "your-gateway-api-key",
+  "auth_dir": "./app/auths",
+  "bin_dir": "./app",
+  "port": 8321,
+  "host": "127.0.0.1"
+}

@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wb2a-panel — workbuddy2api 管理面板</title>
+<style>
+:root{
+  --bg:#faf9f5; --card:#fff; --border:#e3e1db; --fg:#1f1e1c; --muted:#6b6862;
+  --accent:#c96442; --accent-fg:#fff; --ok:#3f7d58; --warn:#b8860b; --err:#b3261e;
+  --chip:#f0eee8; --shadow:0 1px 3px rgba(0,0,0,.06),0 6px 20px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#1a1917; --card:#232220; --border:#37352f; --fg:#eae8e3; --muted:#9c988f;
+         --chip:#2d2b27; --shadow:0 1px 3px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.25); }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 20px 64px}
+header{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:6px}
+h1{margin:0;font-size:22px;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:13px;margin-top:4px}
+.sub code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0 18px}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--border);
+  background:var(--card);color:var(--fg);padding:8px 14px;transition:all .12s}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+button.primary:hover:not(:disabled){filter:brightness(1.08);color:var(--accent-fg)}
+button.global{border-color:#c98a2e;color:#a8721f}
+button.global:hover:not(:disabled){background:#c98a2e;color:#fff;border-color:#c98a2e}
+button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
+.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.stat .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.stat .v{font-size:22px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:var(--shadow)}
+.card.off{opacity:.6}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.chead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:10px}
+.name{font-weight:600;font-size:15.5px}
+.tag{font-size:11px;padding:2px 7px;border-radius:99px;background:var(--chip);color:var(--muted);
+  letter-spacing:.03em;font-weight:600;white-space:nowrap}
+.tag.cn{background:#e3f0e7;color:var(--ok)}
+.tag.global{background:#fbeed8;color:#a8721f}
+@media (prefers-color-scheme:dark){
+  .tag.cn{background:#1f3527;color:#7cc39b}
+  .tag.global{background:#3a2e18;color:#d9a95c}
+}
+.tag.warn{background:#fdecd7;color:var(--warn)}
+.tag.err{background:#fce8e6;color:var(--err)}
+.meta{color:var(--muted);font-size:12.5px;word-break:break-all;margin:2px 0 10px}
+.bar-line{height:5px;background:var(--chip);border-radius:99px;overflow:hidden;margin:9px 0 6px}
+.bar-line > i{display:block;height:100%;background:var(--accent);border-radius:99px}
+.nums{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12.5px;margin-top:10px}
+.kv .k{color:var(--muted)}
+.kv .v{font-variant-numeric:tabular-nums;word-break:break-all}
+.rl{margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:12px;color:var(--warn)}
+.rl b{color:var(--warn)}
+.acts{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin-top:13px;padding-top:12px;
+  border-top:1px solid var(--border)}
+.acts .note{color:var(--muted);font-size:12px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;
+  justify-content:center;padding:20px;z-index:50}
+.modal.on{display:flex}
+.sheet{background:var(--card);border-radius:14px;max-width:580px;width:100%;
+  padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-height:88vh;overflow:auto}
+.sheet h2{margin:0 0 6px;font-size:17px}
+.sheet p{color:var(--muted);font-size:13px;margin:0 0 16px}
+.steps{display:flex;flex-direction:column;gap:10px;margin:16px 0}
+.step{display:flex;gap:11px;align-items:flex-start;font-size:13.5px}
+.dot{width:19px;height:19px;border-radius:99px;border:2px solid var(--border);flex:0 0 auto;
+  margin-top:1px;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.dot.on{border-color:var(--accent);background:var(--accent);color:#fff}
+.dot.done{border-color:var(--ok);background:var(--ok);color:#fff}
+.link{background:var(--chip);border:1px solid var(--border);border-radius:8px;padding:10px 12px;
+  font-size:12.5px;word-break:break-all;color:var(--muted);margin:10px 0;cursor:pointer}
+.link:hover{border-color:var(--accent);color:var(--fg)}
+.warnbox{background:#fdf6e3;border:1px solid #e6d9a8;color:#7a6316;border-radius:9px;
+  padding:11px 13px;font-size:12.8px;margin:12px 0}
+@media (prefers-color-scheme:dark){
+  .warnbox{background:#33290f;border-color:#5a4a1c;color:#dcc37a}
+}
+.infobox{background:var(--chip);border:1px solid var(--border);border-radius:9px;
+  padding:11px 13px;font-size:12.8px;color:var(--muted);margin:12px 0}
+.mlist{display:flex;flex-wrap:wrap;gap:5px}
+.mchip{font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--chip);color:var(--fg);
+  border-radius:6px;padding:2px 7px;cursor:pointer;border:1px solid transparent}
+.mchip:hover{border-color:var(--accent);color:var(--accent)}
+.mchip.tier{background:#fbeed8;color:#a8721f;font-weight:600}
+@media (prefers-color-scheme:dark){ .mchip.tier{background:#3a2e18;color:#d9a95c} }
+.copied{background:var(--ok)!important;color:#fff!important;border-color:var(--ok)!important}
+.stbl{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+.stbl th,.stbl td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border)}
+.stbl th:first-child,.stbl td:first-child{text-align:left;font-family:ui-monospace,Menlo,monospace}
+.stbl th{color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em}
+.empty{text-align:center;color:var(--muted);padding:56px 20px;border:1px dashed var(--border);border-radius:12px}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--fg);
+  color:var(--bg);padding:10px 18px;border-radius:99px;font-size:13.5px;z-index:99;
+  opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw;text-align:center}
+.toast.on{opacity:1}
+.panel{display:none;margin-bottom:22px}
+.panel.on{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>workbuddy2api 管理面板</h1>
+      <div class="sub" id="subline">账号池 · 模型目录 · 请求统计</div>
+    </div>
+    <button class="sm" onclick="loadAll(true)">刷新</button>
+  </header>
+
+  <div class="summary" id="summary"></div>
+
+  <div class="card" id="endpointCard" style="margin-bottom:18px">
+    <div class="chead">
+      <span class="name">下游接入</span>
+      <span class="tag">OpenAI 兼容</span>
+    </div>
+    <div class="kv" style="grid-template-columns:auto 1fr auto;align-items:center">
+      <span class="k">Base URL</span><span class="v" id="epBase">…</span>
+      <button class="sm" onclick="copyEp('epBase')">复制</button>
+      <span class="k">API Key</span><span class="v" id="epKey">…</span>
+      <button class="sm" onclick="copyEp('epKey')">复制</button>
+    </div>
+    <div class="meta" id="epNote" style="margin-top:8px"></div>
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;color:var(--muted);font-size:12.5px">调用示例</summary>
+      <pre id="epSample" style="margin:8px 0 0;white-space:pre-wrap;word-break:break-all;
+        font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--muted)"></pre>
+    </details>
+  </div>
+
+  <div class="bar">
+    <button class="primary" id="btnAddCn" onclick="addAccount('cn')">+ 新增 CN 账号</button>
+    <button class="global" id="btnAddGlobal" onclick="addAccount('global')">+ 新增 Global 账号</button>
+    <button id="btnCheckin" onclick="runAction('checkin','CN 签到')">CN 签到</button>
+    <button id="btnTrial" onclick="runAction('trial','领 Global 试用')">领 Global 试用</button>
+    <button onclick="toggle('modelPanel',this,'模型目录')">查看模型目录</button>
+    <button onclick="toggle('statsPanel',this,'请求统计')">查看请求统计</button>
+  </div>
+
+  <div class="panel" id="capPanel">
+    <div class="infobox" id="capBody"></div>
+  </div>
+
+  <div class="panel" id="outPanel">
+    <div class="card">
+      <div class="chead">
+        <span class="name" id="outTitle">执行结果</span>
+        <button class="sm" style="margin-left:auto" onclick="$('outPanel').classList.remove('on')">关闭</button>
+      </div>
+      <pre id="outBody" style="margin:8px 0 0;white-space:pre-wrap;word-break:break-all;
+        font:12.5px/1.55 ui-monospace,Menlo,monospace;color:var(--muted)"></pre>
+    </div>
+  </div>
+
+  <div class="panel" id="modelPanel">
+    <div class="card">
+      <div class="chead">
+        <span class="name">模型目录</span>
+        <span class="tag" id="modelStats">…</span>
+        <button class="sm" style="margin-left:auto" onclick="loadModels()">重新读取</button>
+      </div>
+      <div class="warnbox">
+        <b>名字前缀决定用哪边账号</b>：<code>cn:</code> 强制 CN ·
+        <code>global:</code> 强制 Global（不带前缀会被当作 CN，Global 独有模型会失败）。
+        点模型名即可复制。<br>
+        <b>档位模型</b>（快速/均衡/极致）是服务端实时挑具体模型的路由别名，
+        返回的 <code>model</code> 字段是实际选中的那个，不是固定映射。
+      </div>
+      <div id="modelBody" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="statsPanel">
+    <div class="card">
+      <div class="chead">
+        <span class="name">请求统计</span>
+        <span class="tag" id="statsSince">…</span>
+        <button class="sm" style="margin-left:auto" onclick="loadStats()">刷新</button>
+      </div>
+      <div id="statsBody" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="grid" id="grid"></div>
+</div>
+
+<div class="modal" id="loginModal">
+  <div class="sheet">
+    <h2 id="lmTitle">新增账号</h2>
+    <p id="lmDesc"></p>
+    <div class="warnbox">
+      <b>必须用无痕窗口登录，本面板不会自动打开。</b>
+      普通窗口里已有账号登录态时，SSO 会直接复用那个账号 ——
+      你会看到「登录成功」，但其实只是把同一个账号覆盖了一遍。
+    </div>
+    <div class="steps">
+      <div class="step"><span class="dot on" id="d1">1</span><span id="s1">已申请登录会话</span></div>
+      <div class="step"><span class="dot" id="d2">2</span><span id="s2">先开好无痕窗口，再点下面的按钮或粘贴地址</span></div>
+      <div class="step"><span class="dot" id="d3">3</span><span id="s3">等待登录完成…</span></div>
+    </div>
+    <div id="lmGoWrap" style="display:none">
+      <button class="primary" id="lmGo" style="width:100%;padding:11px">在新标签打开登录页</button>
+      <div class="meta" style="margin:10px 0 0;text-align:center">
+        用不惯这个按钮？点下面的地址复制，粘贴到你开好的无痕窗口：
+      </div>
+    </div>
+    <div class="link" id="lmUrl">正在申请登录地址…</div>
+    <div class="bar" style="margin:0">
+      <button onclick="closeLogin()">取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let ST = null, EP = null, TIMER = null, CURRENT = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const TIERS = new Set(['auto','default','fast-model','balanced-model','deep-model','primary-model','default-model']);
+
+function toast(msg, ms = 2600) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('on'), ms);
+}
+async function api(path, opts) {
+  try {
+    const r = await fetch('/api' + path, opts);
+    return await r.json();
+  } catch (e) { return {error: String(e)}; }
+}
+const isZeroTime = s => !s || String(s).startsWith('0001-01-01');
+const fmtTime = s => isZeroTime(s) ? '—' : String(s).slice(5, 16).replace('T', ' ');
+
+function toggle(id, btn, name) {
+  const el = $(id), on = el.classList.toggle('on');
+  btn.textContent = (on ? '收起' : '查看') + name;
+  if (on && id === 'modelPanel' && !$('modelBody').dataset.loaded) loadModels();
+  if (on && id === 'statsPanel') loadStats();
+}
+
+// ── 渲染 ──────────────────────────────────────────────────────────────
+function render() {
+  const d = ST || {};
+  const accts = d.accounts || [];
+  const cn = accts.filter(a => a.realm === 'cn').length;
+  const gl = accts.filter(a => a.realm === 'global').length;
+  const healthy = d.healthy ?? accts.filter(a => !a.disabled && !a.manual_disabled).length;
+  const bad = accts.filter(a => a.disabled || a.manual_disabled || a.cooling).length;
+  const credit = d.credits_total;
+  const size = d.credits_size_total;
+
+  $('summary').innerHTML = `
+    <div class="stat"><div class="k">账号总数</div><div class="v">${d.total ?? accts.length}</div></div>
+    <div class="stat"><div class="k">CN / Global</div><div class="v">${cn} / ${gl}</div></div>
+    <div class="stat"><div class="k">健康</div><div class="v" style="color:${healthy ? 'var(--ok)' : 'var(--err)'}">${healthy}</div></div>
+    <div class="stat"><div class="k">剩余积分</div><div class="v">${credit != null ? credit : '—'}${
+      size ? `<span style="font-size:12px;color:var(--muted);font-weight:400"> / ${size}</span>` : ''}</div></div>
+    <div class="stat"><div class="k">异常</div><div class="v" style="color:${bad ? 'var(--err)' : 'inherit'}">${bad}</div></div>`;
+
+  if (!accts.length) {
+    $('grid').innerHTML = '<div class="empty">账号池是空的。用上面的「新增账号」，'
+      + '或在网关侧跑 <code>./login.sh</code>（新账号会被自动加载）。</div>';
+    return;
+  }
+
+  $('grid').innerHTML = accts.map(a => {
+    const isGl = a.realm === 'global';
+    const tags = [
+      `<span class="tag ${isGl ? 'global' : 'cn'}">${isGl ? 'Global' : 'CN'}</span>`,
+      a.manual_disabled ? `<span class="tag warn" title="${esc(a.manual_reason || '')}">手动停用</span>` : '',
+      a.disabled ? `<span class="tag err" title="${esc(a.disabled_reason || '')}">自动禁用</span>` : '',
+      a.cooling ? '<span class="tag warn">冷却中</span>' : '',
+      a.breaker_fails > 0 ? `<span class="tag warn">熔断 ${a.breaker_fails}</span>` : '',
+      !isZeroTime(a.degrade_until) ? '<span class="tag warn">降级中</span>' : '',
+      a.in_flight > 0 ? `<span class="tag">在途 ${a.in_flight}</span>` : '',
+    ].join('');
+
+    const hasCredit = a.credits_size != null;
+    const pct = hasCredit && a.credits_size
+      ? Math.min(100, Math.round((a.credits || 0) / a.credits_size * 100)) : 0;
+    const rl = (a.rate_limited_models || []).filter(
+      x => !String(x.reason || '').startsWith('11102'));   // 11102 = 本区无此模型，非限流
+
+    return `<div class="card ${a.disabled || a.manual_disabled ? 'off' : ''}">
+      <div class="chead"><span class="name">${esc(a.nickname || a.uid)}</span>${tags}</div>
+      <div class="meta">${esc(a.uid)}</div>
+      ${hasCredit ? `<div class="bar-line"><i style="width:${pct}%"></i></div>
+        <div class="nums"><span>余 <b style="color:var(--fg)">${a.credits ?? '?'}</b></span>
+        <span>已用 ${a.credits_used ?? '?'}</span><span>池 ${a.credits_size ?? '?'}</span></div>`
+      : `<div class="nums"><span>积分 ${a.credits ?? '?'}${a.credits_live ? '' : '（未启用实时查询）'}</span></div>`}
+      <div class="kv">
+        <span class="k">成功次数</span><span class="v">${a.success_count ?? 0}</span>
+        <span class="k">最近成功</span><span class="v">${fmtTime(a.last_success)}</span>
+        <span class="k">最近错误</span><span class="v">${fmtTime(a.last_err)}</span>
+        <span class="k">连续失败</span><span class="v">${a.consecutive_fails ?? 0}</span>
+        ${!isZeroTime(a.until) ? `<span class="k">冷却至</span><span class="v">${fmtTime(a.until)}</span>` : ''}
+      </div>
+      ${rl.length ? `<div class="rl"><b>模型限流 ${rl.length} 个</b>：${
+        rl.slice(0, 4).map(x => esc(x.model)).join('、')}${rl.length > 4 ? ' 等' : ''}
+        <div style="margin-top:3px">${esc(rl[0].reason || '')}${
+          isZeroTime(rl[0].until) ? '' : ' · 至 ' + fmtTime(rl[0].until)}</div></div>` : ''}
+      <div class="acts">
+        ${a.manual_disabled
+          ? `<button class="sm" onclick="acctOp('enable','${esc(a.uid)}')">恢复启用</button>
+             <span class="note">${esc(a.manual_reason || '已手动停用')}</span>`
+          : `<button class="sm" onclick="acctOp('disable','${esc(a.uid)}')">临时停用</button>`}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function loadAll(loud) {
+  const st = await api('/status');
+  if (st && !st.error) {
+    ST = st;
+  } else {
+    if (loud) toast('读取状态失败：' + JSON.stringify(st).slice(0, 120), 5000);
+    $('grid').innerHTML = '<div class="empty">连不上网关。确认网关在运行，且面板的 --base 指向正确。</div>';
+    return;
+  }
+  render();
+  if (!EP) loadEndpoint();
+  if ($('statsPanel').classList.contains('on')) loadStats();
+}
+
+async function loadEndpoint() {
+  const e = await api('/endpoint');
+  if (!e || e.error) return;
+  EP = e;
+  $('epBase').textContent = e.base_url;
+  $('epKey').textContent = e.api_key;
+  const caps = e.capabilities || {};
+  $('subline').innerHTML = `账号池 · 模型目录 · 请求统计　网关 <code>${esc(e.gateway)}</code>`;
+  // 内网地址只在面板确实对外监听时才印出来；否则给出不含具体地址的通用提示
+  //（内网地址属于拓扑信息，不该默认展示 —— 截图/投屏时容易外泄）。
+  const lan = (e.base_url_lan.match(/\/\/([^:]+):/) || [])[1];
+  $('epNote').innerHTML = lan
+    ? `同机直连用上面的地址；局域网其他机器把 <code>127.0.0.1</code> 换成 <code>${esc(lan)}</code>。`
+    : `上面是面板所在机器上的地址。要让局域网其他机器访问，把 <code>127.0.0.1</code> 换成那台机器的局域网 IP 即可。`;
+  $('epSample').textContent =
+    `curl ${e.base_url}/chat/completions \\\n` +
+    `  -H "Authorization: Bearer ${e.api_key}" \\\n` +
+    `  -H "Content-Type: application/json" \\\n` +
+    `  -d '{"model":"cn:glm-5.3","messages":[{"role":"user","content":"hi"}]}'`;
+
+  // 能力开关：不可用的功能直接禁用按钮并说明原因，而不是等用户点了才报错
+  const missing = [];
+  if (!caps.login) { $('btnAddCn').disabled = true; $('btnAddGlobal').disabled = true; missing.push('新增账号'); }
+  if (!caps.checkin) $('btnCheckin').disabled = true;
+  if (!caps.trial) $('btnTrial').disabled = true;
+  if (missing.length) {
+    const extra = [];
+    if (!caps.bin_dir) extra.push('未检测到网关程序目录（--bin-dir）');
+    if (!caps.auth_dir) extra.push('未检测到凭据目录（--auth-dir）');
+    $('capBody').innerHTML = `<b>部分功能未启用</b>：${missing.join('、')}。<br>` +
+      `这些功能需要面板与网关<b>同机部署</b>（要能调到网关的 CLI 工具与 auths 目录）。` +
+      (extra.length ? `<br>${extra.join('；')}。` : '') +
+      `<br>你也可以在网关侧直接用 <code>./login.sh</code> / <code>./signin.sh</code>，` +
+      `效果相同 —— 新账号会被网关自动加载。`;
+    $('capPanel').classList.add('on');
+  }
+}
+
+async function copyEp(id) {
+  const t = $(id).textContent;
+  if (!t || t === '…') return;
+  try { await navigator.clipboard.writeText(t); toast('已复制', 1400); }
+  catch (e) { toast('复制失败，请手动选中', 2600); }
+}
+
+// ── 模型目录 ──────────────────────────────────────────────────────────
+async function loadModels() {
+  $('modelStats').textContent = '读取中…';
+  const r = await api('/models');
+  const m = (r && r.models) || {};
+  const cn = (m.cn || []).slice().sort(), gl = (m.global || []).slice().sort(),
+        bare = (m.bare || []).slice().sort();
+  $('modelBody').dataset.loaded = '1';
+  if (!cn.length && !gl.length && !bare.length) {
+    $('modelStats').textContent = '无数据';
+    $('modelBody').innerHTML =
+      '<div class="meta">网关没有返回模型。可能是账号池为空，或该区域的模型探测还在进行。</div>';
+    return;
+  }
+  $('modelStats').textContent = `CN ${cn.length} · Global ${gl.length}`;
+  const col = (title, tagCls, tagText, list, prefix) => `<div>
+      <h4 style="margin:0 0 4px;font-size:13.5px">${title}${
+        tagText ? ` <span class="tag ${tagCls}">${tagText}</span>` : ''}</h4>
+      <span style="color:var(--muted);font-size:12px;display:block;margin-bottom:9px">${list.length} 个</span>
+      <div class="mlist">${list.map(x => {
+        const full = prefix + x;
+        return `<span class="mchip ${TIERS.has(x) ? 'tier' : ''}" data-m="${esc(full)}"
+          onclick="copyModel(this)">${esc(full)}</span>`;
+      }).join('')}</div>
+    </div>`;
+  $('modelBody').innerHTML = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      ${col('CN 侧模型', 'cn', 'CN', cn, 'cn:')}
+      ${col('Global 侧模型', 'global', 'Global', gl, 'global:')}
+    </div>${bare.length ? `<div style="margin-top:14px">${col('无前缀', '', '', bare, '')}</div>` : ''}`;
+}
+
+async function copyModel(el) {
+  const name = el.dataset.m;
+  try {
+    await navigator.clipboard.writeText(name);
+    el.classList.add('copied');
+    setTimeout(() => el.classList.remove('copied'), 900);
+    toast('已复制：' + name, 1600);
+  } catch (e) { toast('复制失败，模型名：' + name, 3000); }
+}
+
+// ── 请求统计 ──────────────────────────────────────────────────────────
+async function loadStats() {
+  const s = await api('/stats');
+  if (!s || s.error || !s.total) {
+    $('statsBody').innerHTML = '<div class="meta">统计不可用（网关可能未启用或版本较旧）。</div>';
+    return;
+  }
+  $('statsSince').textContent = '自 ' + fmtTime(s.since) + ' · 运行 ' +
+    Math.round((s.uptime_sec || 0) / 60) + ' 分钟';
+  const rows = [s.total].concat(s.models || []);
+  const pct = (a, b) => b ? Math.round(a / b * 100) + '%' : '—';
+  $('statsBody').innerHTML = `<table class="stbl"><thead><tr>
+      <th>模型</th><th>请求</th><th>成功</th><th>失败</th>
+      <th>平均延迟</th><th>tokens</th><th>缓存命中</th><th>计费</th>
+    </tr></thead><tbody>
+    ${rows.map(r => `<tr>
+      <td>${esc(r.model)}</td>
+      <td>${r.requests ?? 0}</td>
+      <td>${r.success ?? 0}</td>
+      <td>${r.failed ? `<span style="color:var(--err)">${r.failed}</span>` : 0}</td>
+      <td>${r.avg_latency_ms ? Math.round(r.avg_latency_ms) + ' ms' : '—'}</td>
+      <td>${r.total_tokens ?? 0}</td>
+      <td>${(r.cache_hit_tokens || r.cache_miss_tokens)
+            ? pct(r.cache_hit_tokens || 0, (r.cache_hit_tokens || 0) + (r.cache_miss_tokens || 0)) : '—'}</td>
+      <td>${r.credit ? Number(r.credit).toFixed(3) : '—'}</td>
+    </tr>`).join('')}
+  </tbody></table>`;
+}
+
+// ── 账号运维 ──────────────────────────────────────────────────────────
+async function acctOp(action, uid) {
+  if (action === 'disable' && !confirm(
+      '临时停用这个账号？\n\n它会退出对话选号，但仍留在池里 —— ' +
+      '签到、token 保活照常，凭证与积分不受影响。\n随时可点「恢复启用」放回。')) return;
+  const r = await api('/account/' + action, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({uid, reason: '面板停用'}),
+  });
+  if (r && r.error) { toast(r.error, 7000); return; }
+  const bits = [];
+  if (r.manual_disabled) bits.push('手动停用');
+  if (r.disabled) bits.push('自动禁用（系统判定，需等自愈）');
+  toast((action === 'disable' ? '已停用：' : '已恢复：') + (bits.join(' + ') || '正常'), 3600);
+  await loadAll();
+}
+
+async function runAction(kind, label) {
+  $('outTitle').textContent = label + ' — 执行中…';
+  $('outBody').textContent = '正在执行，请稍候…';
+  $('outPanel').classList.add('on');
+  const r = await api('/' + kind, {method: 'POST'});
+  $('outTitle').textContent = label + (r && r.ok ? ' — 完成' : ' — 未成功');
+  $('outBody').textContent = (r && r.output) || '(无输出)';
+  toast(label + (r && r.ok ? ' 完成' : ' 结束（见结果面板）'), 3000);
+  await loadAll();
+}
+
+// ── 新增账号 ──────────────────────────────────────────────────────────
+// 刻意不自动打开登录页：用户往往还没切到无痕窗口就点了按钮，
+// 自动弹窗会带着已有的 SSO 登录态走完流程 —— 看着"成功"，实际覆盖了旧账号。
+function addAccount(realm) {
+  closeLogin();
+  prepareLoginUI(realm);
+  startLogin(realm);
+}
+
+function prepareLoginUI(realm) {
+  CURRENT = {realm};
+  $('lmTitle').textContent = realm === 'global' ? '新增 Global 账号' : '新增 CN 账号';
+  $('lmDesc').textContent = realm === 'global'
+    ? '走国际版登录（www.workbuddy.ai），完成后会自动尝试完善注册地区。'
+    : '走国内版登录（copilot.tencent.com），成功后自动加入账号池。';
+  $('s2').textContent = realm === 'global'
+    ? '先在无痕窗口里用 Global 账号登录（Google / 邮箱 / 手机号）'
+    : '先在无痕窗口里登录（微信 / QQ / 手机号）';
+  $('s3').textContent = '等待登录完成…';
+  $('lmUrl').textContent = '正在申请登录地址…';
+  $('lmGoWrap').style.display = 'none';
+  $('d1').className = 'dot on'; $('d1').textContent = '1';
+  $('d2').className = 'dot'; $('d2').textContent = '2';
+  $('d3').className = 'dot'; $('d3').textContent = '3';
+  $('loginModal').classList.add('on');
+}
+
+async function startLogin(realm) {
+  const r = await api('/login/start', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({realm}),
+  });
+  if (!r || !r.url) {
+    toast((r && r.error) || '申请登录地址失败', 8000);
+    $('lmUrl').textContent = (r && r.error) || '申请失败';
+    return;
+  }
+  $('d1').className = 'dot done'; $('d1').textContent = '✓';
+  $('d2').className = 'dot on';
+  $('lmUrl').textContent = r.url;
+  $('lmUrl').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(r.url);
+      $('lmUrl').classList.add('copied');
+      setTimeout(() => $('lmUrl').classList.remove('copied'), 900);
+      toast('已复制登录地址', 1600);
+    } catch (e) { toast('复制失败，请手动选中复制', 3000); }
+  };
+  $('lmGo').onclick = () => window.open(r.url, '_blank');
+  $('lmGoWrap').style.display = 'block';
+
+  clearInterval(TIMER);
+  let ticks = 0;
+  TIMER = setInterval(() => pollLogin(++ticks), 3000);
+  pollLogin(0);
+}
+
+async function pollLogin(ticks) {
+  if (!CURRENT) return;
+  if (ticks > 100) { clearInterval(TIMER); toast('登录超时（5 分钟）', 6000); return; }
+  const s = await api('/login/status');
+  if (!s) return;
+  if (s.stage === 'done') return finishLogin(s.message);
+  if (s.stage === 'error' || s.stage === 'timeout') {
+    clearInterval(TIMER);
+    toast(s.message || '登录失败', 9000);
+    $('lmUrl').textContent = s.message || '失败';
+    return;
+  }
+  if (s.message) $('s3').textContent = s.message;
+}
+
+async function finishLogin(msg) {
+  clearInterval(TIMER);
+  $('d2').className = 'dot done'; $('d2').textContent = '✓';
+  $('d3').className = 'dot done'; $('d3').textContent = '✓';
+  $('s3').textContent = msg;
+  toast(msg, 5000);
+  await loadAll();
+  setTimeout(closeLogin, 1800);
+}
+
+function closeLogin() {
+  clearInterval(TIMER);
+  CURRENT = null;
+  $('loginModal').classList.remove('on');
+  fetch('/api/login/cancel', {method: 'POST'}).catch(() => {});
+}
+
+document.querySelectorAll('.modal').forEach(m => {
+  m.addEventListener('click', e => { if (e.target === m) closeLogin(); });
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLogin(); });
+
+loadAll();
+setInterval(() => { if (!CURRENT) loadAll(); }, 15000);
+</script>
+</body>
+</html>

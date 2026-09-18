@@ -1,0 +1,17 @@
+# 面板自己的配置（含 api_key）——用 panel.example.json 作模板
+panel.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时
+*.log
+.panel.pid
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
