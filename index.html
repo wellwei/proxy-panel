@@ -224,6 +224,9 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
 
 <script>
 let ST = null, EP = null, TIMER = null, CURRENT = null;
+// 面板 API 基址从当前路径推导，而不是写死 /api：
+// 这样面板既能直接挂在根路径，也能挂在反向代理的子路径下（如 /panel/）。
+const API_BASE = location.pathname.replace(/\/[^/]*$/, '') + '/api';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -234,8 +237,12 @@ function toast(msg, ms = 2600) {
   clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('on'), ms);
 }
 async function api(path, opts) {
+  // 状态变更请求带 X-Panel-Request 头：面板用它挡跨站 POST（见 panel.py do_POST）
+  if (opts && opts.method === 'POST') {
+    opts.headers = Object.assign({'X-Panel-Request': '1'}, opts.headers || {});
+  }
   try {
-    const r = await fetch('/api' + path, opts);
+    const r = await fetch(API_BASE + path, opts);
     return await r.json();
   } catch (e) { return {error: String(e)}; }
 }
@@ -563,7 +570,8 @@ function closeLogin() {
   clearInterval(TIMER);
   CURRENT = null;
   $('loginModal').classList.remove('on');
-  fetch('/api/login/cancel', {method: 'POST'}).catch(() => {});
+  fetch(API_BASE + '/login/cancel',
+        {method: 'POST', headers: {'X-Panel-Request': '1'}}).catch(() => {});
 }
 
 document.querySelectorAll('.modal').forEach(m => {

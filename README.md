@@ -122,7 +122,8 @@ WB2A_API_KEY=sk-your-key docker compose up -d
 并设置 `WB2A_BIN_DIR` / `WB2A_AUTH_DIR`。
 
 **能从别的机器访问吗** — 默认不行（只绑回环）。加 `--host 0.0.0.0` 可以，
-但面板没有账号体系，任何能访问到它的人都能读到 api_key。仅限可信网络。
+但面板没有账号体系，任何能访问到它的人都能读到 api_key。仅限可信网络；
+要公网访问请挂到带认证的反代子路径下（见「安全边界」）。
 
 **Docker 里内网地址显示的是容器 IP** — 容器内的网卡探测拿到的是容器自己的地址，
 对你从外部访问没有意义。所以 Docker 下建议保持默认（不显示）；需要给其他机器用，
@@ -131,7 +132,7 @@ WB2A_API_KEY=sk-your-key docker compose up -d
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -v      # 31 个单元测试
+python3 -m unittest discover -s tests -v      # 51 个测试（36 单元 + 15 冒烟）
 python3 tests/stub_gateway.py --port 7999 &   # 假网关，用于本地调面板
 python3 panel.py --base http://127.0.0.1:7999 --key test
 ```
@@ -142,16 +143,41 @@ python3 panel.py --base http://127.0.0.1:7999 --key test
 
 **面板持有网关的 api_key，等价于网关的管理权限。** 因此：
 
-- **默认只监听 `127.0.0.1`**，仅本机可访问。要用局域网其他机器访问必须显式
+- 默认只监听 `127.0.0.1`，仅本机可访问。要用局域网其他机器访问必须显式
   `--host 0.0.0.0` —— 此时启动横幅会打印醒目告警。别暴露到公网；真要暴露，
-  请在前面套一层带认证的反向代理。
-- **内网地址不会默认显示**。「下游接入」卡片只在面板确实监听在回环之外时，
+  请在前面套一层带认证的反向代理（做法见下）。
+- 内网地址不会默认显示。「下游接入」卡片只在面板确实监听在回环之外时，
   才提示局域网地址（此时它才是"其他机器该填什么"的可操作信息）；绑回环时它是
   不可达的误导信息，也是多余的拓扑信息（截图 / 投屏时容易外泄）。
-- **加强增强功能的那些 CLI 工具与 auths 目录**由面板按需调用；面板本身不存储
+- 加强增强功能的那些 CLI 工具与 auths 目录由面板按需调用；面板本身不存储
   任何凭据，账号凭据始终由网关管理。
 - api_key 会明文展示在「下游接入」卡片上供你复制使用。如果你不希望页面出现它，
   删掉 `panel.py` 的 `endpoint_info()` 里的 `api_key` 字段即可。
+
+### 挂在反向代理的子路径下
+
+面板支持挂在子路径（如 `https://example.com/panel/`）。它不关心前缀是什么 ——
+只要代理把前缀**剥掉**再转发，面板看到的仍是 `/` 和 `/api/*`：
+
+```caddyfile
+redir /panel /panel/ permanent          # 无尾斜杠要补，否则相对路径解析到根
+handle_path /panel/* {                  # handle_path 负责剥前缀
+    basic_auth {                        # ★ 认证必须有：面板等价管理权限
+        {$PANEL_USER:admin} {$PANEL_PASSWORD_HASH}
+    }
+    reverse_proxy 127.0.0.1:8321
+}
+```
+
+三条配套注意事项：
+
+- **`X-Panel-Request: 1` 头**：状态变更接口（POST）要求带这个头，用来挡跨站请求 ——
+  反向代理上的认证凭据是浏览器自动附带的，跨站页面也能触发 POST。
+  脚本调用记得加上（`curl -H 'X-Panel-Request: 1' -X POST ...`），浏览器里正常使用不受影响。
+- **口令别写进配置文件**：用环境变量注入 bcrypt 哈希（`caddy hash-password` 生成）。
+  配置里缺失时 Caddy 会拒绝加载，不会静默变成"无认证"。
+- **响应头**：面板已自带 `nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer`，
+  代理不需要额外加。
 
 ## 许可
 

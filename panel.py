@@ -32,7 +32,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -582,6 +582,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # 面板可能被放在反向代理后面（含浏览器缓存的凭据），这三条都是零成本兜底：
+        # nosniff 阻止把返回体当别的类型解释，DENY 挡掉点击劫持，no-referrer 不泄漏地址
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -617,6 +622,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        # CSRF 闸门：状态变更接口只认带自定义头的请求。
+        # 反向代理上的 Basic 认证凭据是浏览器自动附带的，跨站页面也能触发 POST
+        # （表单 + sendBeacon 都不需要预检）；而自定义头会强制预检，被 CORS 挡下。
+        # 纯 API 调用者补一个 -H 'X-Panel-Request: 1' 即可。
+        if self.headers.get("X-Panel-Request") != "1":
+            return self._send(403, {"error": "拒绝跨站请求：缺少 X-Panel-Request: 1 头。"
+                                             "用脚本调用时请显式加上；浏览器里正常点击不受影响。"})
         path = self.path.split("?", 1)[0]
         p = self.panel
         body = self._body()

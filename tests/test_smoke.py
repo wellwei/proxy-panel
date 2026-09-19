@@ -25,11 +25,17 @@ def _get(url, timeout=10):
         return r.status, r.read().decode("utf-8", "replace")
 
 
-def _post(url, payload, timeout=10):
-    """POST 并返回 (status, body)。4xx 也当正常结果返回（面板用它表达参数错误）。"""
+def _post(url, payload, timeout=10, csrf=True):
+    """POST 并返回 (status, body)。4xx 也当正常结果返回（面板用它表达参数错误）。
+
+    默认带上 X-Panel-Request 头（面板要求状态变更请求必须带，见 panel.py do_POST）；
+    csrf=False 用来验证缺头时确实被拒。
+    """
+    headers = {"Content-Type": "application/json"}
+    if csrf:
+        headers["X-Panel-Request"] = "1"
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="POST",
-        headers={"Content-Type": "application/json"})
+        url, data=json.dumps(payload).encode(), method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace")
@@ -167,6 +173,31 @@ class TestSmoke(unittest.TestCase):
         d = json.loads(body)
         self.assertIn("error", d)
         self.assertIn("同机部署", d["error"])
+
+    def test_post_without_csrf_header_rejected(self):
+        """缺 X-Panel-Request 头的 POST 必须被拒 —— 这是防跨站触发状态变更的那道闸。"""
+        status, body = _post("http://127.0.0.1:%d/api/account/disable" % PANEL_PORT,
+                             {"uid": "cn-uid-1"}, csrf=False)
+        self.assertEqual(status, 403)
+        self.assertIn("X-Panel-Request", json.loads(body)["error"])
+        # 再确认没被真的停用
+        _, st = _get("http://127.0.0.1:%d/api/status" % PANEL_PORT)
+        accts = {a["uid"]: a for a in json.loads(st)["accounts"]}
+        self.assertFalse(accts["cn-uid-1"]["manual_disabled"])
+
+    def test_security_headers_present(self):
+        """安全响应头：nosniff / DENY / no-referrer 三个零成本兜底。"""
+        req = urllib.request.Request("http://127.0.0.1:%d/" % PANEL_PORT)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.headers.get("X-Content-Type-Options"), "nosniff")
+            self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
+            self.assertEqual(r.headers.get("Referrer-Policy"), "no-referrer")
+
+    def test_api_base_is_relative(self):
+        """页面里的 API 基址必须从当前路径推导 —— 面板要能挂在反向代理的子路径下。"""
+        _, body = _get("http://127.0.0.1:%d/" % PANEL_PORT)
+        self.assertIn("location.pathname", body)
+        self.assertNotIn("fetch('/api", body)
 
     def test_404_for_unknown_route(self):
         try:
