@@ -9,10 +9,12 @@
   --bg:#faf9f5; --card:#fff; --border:#e3e1db; --fg:#1f1e1c; --muted:#6b6862;
   --accent:#c96442; --accent-fg:#fff; --ok:#3f7d58; --warn:#b8860b; --err:#b3261e;
   --chip:#f0eee8; --shadow:0 1px 3px rgba(0,0,0,.06),0 6px 20px rgba(0,0,0,.04);
+  --cline:#4a6fa5; --cline-soft:#e8eff9;
 }
 @media (prefers-color-scheme:dark){
   :root{ --bg:#1a1917; --card:#232220; --border:#37352f; --fg:#eae8e3; --muted:#9c988f;
-         --chip:#2d2b27; --shadow:0 1px 3px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.25); }
+         --chip:#2d2b27; --shadow:0 1px 3px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.25);
+         --cline:#7fa3d8; --cline-soft:#1e2a3d; }
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
@@ -51,6 +53,10 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
 }
 .tag.warn{background:#fdecd7;color:var(--warn)}
 .tag.err{background:#fce8e6;color:var(--err)}
+.tag.ok{background:#e3f0e7;color:var(--ok)}
+@media (prefers-color-scheme:dark){
+  .tag.ok{background:#1f3527;color:#7cc39b}
+}
 .meta{color:var(--muted);font-size:12.5px;word-break:break-all;margin:2px 0 10px}
 .bar-line{height:5px;background:var(--chip);border-radius:99px;overflow:hidden;margin:9px 0 6px}
 .bar-line > i{display:block;height:100%;background:var(--accent);border-radius:99px}
@@ -135,6 +141,26 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
       <pre id="epSample" style="margin:8px 0 0;white-space:pre-wrap;word-break:break-all;
         font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--muted)"></pre>
     </details>
+  </div>
+
+  <!-- ── cline2api 子面板（第二个上游网关；未配置时整块隐藏）────── -->
+  <div id="clineSection" style="display:none">
+    <div class="chead" style="margin:26px 0 12px">
+      <span class="name" style="color:var(--cline)">cline2api · Cline 免费层</span>
+      <span class="tag" id="clineState">…</span>
+      <button class="sm" style="margin-left:auto" onclick="loadCline()">刷新</button>
+    </div>
+    <div class="summary" id="clineSummary"></div>
+
+    <div class="warnbox">
+      <b>定价闸门</b>：recommended 组模型先探针后放行（cost=0 才入池），每次真实响应复核
+      上游计费成本，一旦 &gt;0 立即自动关停并从这里摘除——所以下面「已关停」的模型是
+      <b>正常保护结果</b>，不是故障。手动启用仍受运行期成本观测约束（成本永远赢）。
+    </div>
+
+    <div class="bar" id="clineBar" style="margin:14px 0 16px"></div>
+
+    <div class="grid" id="clineModels"></div>
   </div>
 
   <div class="bar">
@@ -579,8 +605,177 @@ document.querySelectorAll('.modal').forEach(m => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLogin(); });
 
+// ── cline2api 子面板 ──────────────────────────────────────────────────
+// 整块按需渲染：面板未配置 cline2api 时后端返回 503，这里据此隐藏整节，
+// 老部署的页面看起来与单网关版没有区别。
+const GATE_LABEL = {
+  free: ['免费档', 'ok'], exposed: ['已放行', 'ok'],
+  unverified: ['待探针', 'warn'], disabled: ['已关停', 'err'],
+};
+let CLINE_OFF = false;   // 面板未配置 cline2api 时置位，停止轮询
+
+async function loadCline() {
+  // 未配置 cline2api 的部署：后端一律 503。记住这一点后就不再轮询——
+  // 否则每 15 秒一次 503 只会在网关日志里刷屏，页面反正也没有可显示的东西。
+  if (CLINE_OFF) return;
+  const st = await api('/cline/status');
+  if (!st || st.error) {
+    if (st && st.error && String(st.error).includes('未配置')) { CLINE_OFF = true; return; }
+    if (st && st.error) {
+      $('clineSection').style.display = '';
+      $('clineState').textContent = '不可用';
+      $('clineModels').innerHTML = `<div class="empty">读取失败：${esc(st.error)}</div>`;
+    }
+    return;
+  }
+  $('clineSection').style.display = '';
+  const accts = st.accounts || [];
+  const exposed = (st.models || []).filter(m => m.exposed);
+  const disabled = (st.models || []).filter(m => m.state === 'disabled');
+  const pending = (st.models || []).filter(m => m.state === 'unverified');
+  $('clineState').textContent = `${accts.length} 账号 · ${exposed.length} 模型在服`;
+
+  $('clineSummary').innerHTML = `
+    <div class="stat"><div class="k">账号总数</div><div class="v">${st.accounts_total ?? accts.length}</div></div>
+    <div class="stat"><div class="k">可用账号</div><div class="v" style="color:${
+      (st.accounts_available || 0) ? 'var(--ok)' : 'var(--err)'}">${st.accounts_available ?? 0}</div></div>
+    <div class="stat"><div class="k">在服模型</div><div class="v" style="color:var(--ok)">${exposed.length}</div></div>
+    <div class="stat"><div class="k">已关停</div><div class="v" style="color:${
+      disabled.length ? 'var(--warn)' : 'inherit'}">${disabled.length}</div></div>
+    <div class="stat"><div class="k">待探针</div><div class="v" style="color:${
+      pending.length ? 'var(--warn)' : 'inherit'}">${pending.length}</div></div>`;
+
+  const acts = `<div class="acts">
+    <button class="sm" onclick="clineRecheck()">立即复测全部模型</button>
+    <button class="sm" onclick="clineAdd()">+ 新增 Cline 账号</button>
+  </div>`;
+
+  $('clineBar').innerHTML = acts;
+  const acctCards = accts.map(a => {
+    const st2 = a.status || 'active';
+    const tag = st2 === 'active' ? '<span class="tag cn">可用</span>'
+      : st2 === 'cooldown' ? '<span class="tag warn">冷却中</span>'
+      : st2 === 'expired' ? '<span class="tag err">凭据失效</span>'
+      : `<span class="tag warn">${esc(st2)}</span>`;
+    return `<div class="card ${a.manualDisabled || st2 !== 'active' ? 'off' : ''}">
+      <div class="chead"><span class="name">${esc(a.email || a.accountId || '（无邮箱）')}</span>${tag}${
+        a.manualDisabled ? '<span class="tag warn">手动停用</span>' : ''}</div>
+      <div class="meta">${esc(a.accountId || '')}</div>
+      <div class="kv">
+        <span class="k">请求数</span><span class="v">${a.requestsTotal ?? 0}（今日 ${a.requestsToday ?? 0}）</span>
+        <span class="k">Token</span><span class="v">${(a.tokensTotal ?? 0).toLocaleString()}</span>
+        ${a.lastReason ? `<span class="k">最近原因</span><span class="v">${esc(a.lastReason)}</span>` : ''}
+        ${!isZeroTime(a.cooldownUntil) ? `<span class="k">冷却至</span><span class="v">${
+          fmtTime(a.cooldownUntil)}</span>` : ''}
+      </div>
+      <div class="acts">
+        ${a.manualDisabled
+          ? `<button class="sm" onclick="clineAcct(true,'${esc(a.accountId)}')">恢复启用</button>`
+          : `<button class="sm" onclick="clineAcct(false,'${esc(a.accountId)}')">临时停用</button>`}
+      </div>
+    </div>`;
+  }).join('');
+
+  const sorted = (st.models || []).slice().sort((x, y) =>
+    (x.exposed === y.exposed ? 0 : x.exposed ? -1 : 1) || String(x.bare).localeCompare(String(y.bare)));
+  const modelCards = sorted.map(m => {
+    const [label, cls] = GATE_LABEL[m.state] || [m.state, ''];
+    return `<div class="card ${m.exposed ? '' : 'off'}">
+      <div class="chead">
+        <span class="name" style="font-family:ui-monospace,Menlo,monospace;font-size:13.5px">${esc(m.bare)}</span>
+        <span class="tag ${cls}">${esc(label)}</span>
+        <span class="tag">${esc(m.group)}</span>
+      </div>
+      <div class="meta">${esc(m.upstream)}</div>
+      <div class="kv">
+        <span class="k">请求</span><span class="v">${m.requests ?? 0}</span>
+        <span class="k">最近成本</span><span class="v" style="color:${
+          (m.last_cost || 0) > 0 ? 'var(--err)' : 'inherit'}">${m.last_cost ?? 0}</span>
+        <span class="k">累计成本</span><span class="v">${m.cost_total ?? 0}</span>
+        <span class="k">最近观测</span><span class="v">${fmtTime(m.last_observed)}</span>
+        ${m.probe_streak ? `<span class="k">复测连过</span><span class="v">${m.probe_streak}/3</span>` : ''}
+        ${m.disable_reason ? `<span class="k">关停原因</span><span class="v">${esc(m.disable_reason)}</span>` : ''}
+      </div>
+      <div class="acts">
+        ${m.exposed
+          ? `<button class="sm" onclick="clineModel(false,'${esc(m.upstream)}')">手动关停</button>
+             ${m.manual ? '<span class="note">（手动启用中，成本观测仍生效）</span>' : ''}`
+          : `<button class="sm" onclick="clineModel(true,'${esc(m.upstream)}')">手动启用</button>
+             <span class="note">启用后先经探针，cost=0 才真正放行</span>`}
+      </div>
+    </div>`;
+  }).join('');
+
+  $('clineModels').innerHTML = (acctCards + modelCards)
+    || '<div class="empty">闸门台账为空（目录还没同步？）</div>';
+}
+
+async function clineModel(enable, id) {
+  const r = await api('/cline/model/' + (enable ? 'enable' : 'disable'),
+                      {method: 'POST', body: JSON.stringify({id: id})});
+  toast(r.ok ? (enable ? '已请求启用：' + id : '已手动关停：' + id) : ('失败：' + (r.error || '')), 4000);
+  loadCline();
+}
+
+async function clineAcct(enable, id) {
+  const r = await api('/cline/account/' + (enable ? 'enable' : 'disable'),
+                      {method: 'POST', body: JSON.stringify({id: id})});
+  toast(r.ok ? (enable ? '已恢复账号' : '已停用账号') : ('失败：' + (r.error || '')), 4000);
+  loadCline();
+}
+
+async function clineRecheck() {
+  const r = await api('/cline/recheck', {method: 'POST', body: '{}'});
+  toast(r.ok ? '已启动一轮探针复测（后台跑，稍后刷新看结果）' : ('失败：' + (r.error || '')), 5000);
+}
+
+async function clineAdd() {
+  const r = await api('/cline/login/start', {method: 'POST', body: '{}'});
+  if (!r || r.error || !r.verify_url) {
+    toast('发起登录失败：' + ((r && r.error) || '无返回'), 5000);
+    return;
+  }
+  $('lmTitle').textContent = '新增 Cline 账号';
+  $('lmDesc').textContent = '用浏览器完成 Cline 的设备授权，成功后账号自动入池。';
+  $('lmUrl').textContent = r.verify_url + (r.user_code ? '　（代码 ' + r.user_code + '）' : '');
+  $('lmGo').onclick = () => window.open(r.verify_url, '_blank', 'noopener');
+  $('lmGoWrap').style.display = '';
+  $('d1').className = 'dot done'; $('d1').textContent = '✓';
+  $('d2').className = 'dot on';
+  $('s2').textContent = '在新标签打开授权页并完成登录' + (r.user_code ? '（代码 ' + r.user_code + '）' : '');
+  $('d3').className = 'dot'; $('s3').textContent = '等待登录完成…';
+  $('loginModal').classList.add('on');
+  let ticks = 0;
+  clearInterval(TIMER);
+  TIMER = setInterval(async () => {
+    ticks++;
+    if (ticks > 60) { clearInterval(TIMER); toast('登录超时，请重新发起', 5000); return; }
+    const s = await api('/cline/login/poll?device_code=' + encodeURIComponent(r.device_code));
+    if (!s || s.state === 'pending') return;
+    clearInterval(TIMER);
+    if (s.state === 'done') {
+      $('d2').className = 'dot done'; $('d2').textContent = '✓';
+      $('d3').className = 'dot done'; $('d3').textContent = '✓';
+      $('s3').textContent = '已入池：' + (s.email || s.account_id || '');
+      toast('Cline 账号已入池', 5000);
+      loadCline();
+      setTimeout(closeLogin, 1800);
+    } else {
+      $('d3').className = 'dot'; $('s3').textContent = '失败：' + (s.error || '未知错误');
+      toast('登录失败：' + (s.error || ''), 6000);
+    }
+  }, 3000);
+}
+
+// cline2api 每轮都刷新：面板未配置时它自己会把整节保持隐藏，
+// 所以这里不需要先探测再决定（多一次 if 判断并不能省下这次请求）。
 loadAll();
-setInterval(() => { if (!CURRENT) loadAll(); }, 15000);
+if (document.getElementById('clineSection')) loadCline();
+setInterval(() => {
+  if (CURRENT) return;
+  loadAll();
+  loadCline();
+}, 15000);
 </script>
 </body>
 </html>

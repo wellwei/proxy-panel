@@ -2,6 +2,33 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] — 2026-09-20
+
+支持第二个上游网关（cline2api）：面板可以同时管理 workbuddy2api 与 Cline 账号池。
+
+### 新增
+
+- **cline2api 子面板** — 配置后同页渲染「Cline 免费层」一节：
+  账号池（状态/请求/token/冷却原因、临时停用）、模型定价闸门台账
+  （分组、状态、最近与累计计费成本、关停原因、手动启停）、设备授权登录代理。
+  配置走四级发现（命令行 > 环境变量 > `panel.json` > cline2api 的 `config.json`），
+  通常 `--cline-config /opt/cline2api/config.json` 一条就够。
+- **测试用 cline2api stub**（`tests/stub_cline.py`）—— 按真实形状提供 `/status`、
+  `/v1/models`、`/admin/login/*`、`/admin/models|accounts/{id}/{enable,disable}`，
+  并按真实网关分两套鉴权（admin_token vs api_key）。
+
+### 说明
+
+- **未配置 cline2api 时行为不变**：`/api/cline/*` 返回 503，页面上那一节不出现。
+  冒烟测试专门覆盖了这一降级形态。
+- cline2api 的上游模型名含 `/` 与 `:`，转成管理端点路径时必须 URL 转义
+  （Go 1.22 ServeMux 的 `{id}` 只吃一段）；冒烟测试断言转义-解转义后取回原值。
+- 面板未配置 cline2api 时不再每 15 秒轮询一次该接口（避免日志刷 503）。
+
+### 工程
+
+- 测试：51 → 62 个（单元 36 不变，冒烟 15 → 26）
+
 ## [0.2.0] — 2026-09-19
 
 支持挂在反向代理的子路径下，以及为此必需的防护措施。

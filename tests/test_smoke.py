@@ -207,5 +207,168 @@ class TestSmoke(unittest.TestCase):
             self.assertEqual(e.code, 404)
 
 
+CLINE_GW_PORT = 7903       # 这一组自带 wb2a stub：unittest 按类名字母序跑，
+CLINE_PORT = 7902          # TestClineSmoke 在 TestSmoke 之前，不能借用它的进程
+CLINE_PANEL_PORT = 8402
+PLAIN_PANEL_PORT = 8403    # 只配 wb2a 的面板：验证「未配置 cline2api」的降级形态
+CLINE_ADMIN_TOKEN = "stub-admin"
+
+
+class TestClineSmoke(unittest.TestCase):
+    """第二网关（cline2api）子面板的 HTTP 通路。
+
+    单独起一套进程：既能测「两个网关同时配置」这种真实生产形态，也能测出面板对
+    cline 特有的 id 转义（上游名含 / 与 :）与双 token 鉴权是否用对了。
+    """
+
+    gw: subprocess.Popen = None
+    cline: subprocess.Popen = None
+    panel: subprocess.Popen = None
+    plain: subprocess.Popen = None
+
+    @classmethod
+    def setUpClass(cls):
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        cls.gw = subprocess.Popen(
+            [sys.executable, str(ROOT / "tests" / "stub_gateway.py"), "--port", str(CLINE_GW_PORT)],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.cline = subprocess.Popen(
+            [sys.executable, str(ROOT / "tests" / "stub_cline.py"), "--port", str(CLINE_PORT)],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not (_wait_http("http://127.0.0.1:%d/status" % CLINE_GW_PORT)
+                and _wait_http("http://127.0.0.1:%d/healthz" % CLINE_PORT)):
+            for p in (cls.gw, cls.cline):
+                p.terminate()
+            raise unittest.SkipTest("stub 网关未能启动")
+
+        cls.panel = subprocess.Popen(
+            [sys.executable, str(ROOT / "panel.py"),
+             "--base", "http://127.0.0.1:%d" % CLINE_GW_PORT,
+             "--key", "testkey", "--port", str(CLINE_PANEL_PORT),
+             "--cline-base", "http://127.0.0.1:%d" % CLINE_PORT,
+             "--cline-key", "stub-key",
+             "--cline-admin-token", CLINE_ADMIN_TOKEN],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # 不带 --cline-* 且显式指向一个不存在的 cline 配置：模拟还没上 cline2api 的老部署
+        cls.plain = subprocess.Popen(
+            [sys.executable, str(ROOT / "panel.py"),
+             "--base", "http://127.0.0.1:%d" % CLINE_GW_PORT,
+             "--key", "testkey", "--port", str(PLAIN_PANEL_PORT),
+             "--cline-config", "/nonexistent/cline2api/config.json"],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if not (_wait_http("http://127.0.0.1:%d/" % CLINE_PANEL_PORT)
+                and _wait_http("http://127.0.0.1:%d/" % PLAIN_PANEL_PORT)):
+            for p in (cls.panel, cls.plain, cls.cline, cls.gw):
+                p.terminate()
+            raise unittest.SkipTest("面板未能启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in (cls.panel, cls.plain, cls.cline, cls.gw):
+            if p and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+    def _api(self, path):
+        return _get("http://127.0.0.1:%d%s" % (CLINE_PANEL_PORT, path))
+
+    def _post(self, path, payload):
+        return _post("http://127.0.0.1:%d%s" % (CLINE_PANEL_PORT, path), payload)
+
+    def test_cline_status_proxied(self):
+        """闸门台账要透出，且 exposed 字段能区分在服/关停两类模型。"""
+        status, body = self._api("/api/cline/status")
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["accounts_total"], 2)
+        exposed = [m["bare"] for m in d["models"] if m["exposed"]]
+        self.assertEqual(exposed, ["glm-5.3-flash"])
+
+    def test_cline_models_uses_api_key(self):
+        """模型目录走 api_key 那套鉴权（不是 admin_token）—— 用错会 401。"""
+        status, body = self._api("/api/cline/models")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["id"], "glm-5.3-flash")
+
+    def test_cline_status_wrong_token_is_reported(self):
+        """admin_token 不对时，面板要把上游的 401 变成可读错误而不是崩掉。"""
+        from panel import ClinePanel
+        bad = ClinePanel({"base": "http://127.0.0.1:%d" % CLINE_PORT,
+                          "api_key": "stub-key", "admin_token": "wrong"})
+        self.assertIn("error", bad.status())
+
+    def test_cline_login_flow(self):
+        """设备授权：start 拿 device_code 与授权地址 → cancel 结束会话。"""
+        status, body = self._post("/api/cline/login/start", {})
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["device_code"], "dev-1")
+        self.assertIn("cline.bot", d["verify_url"])
+
+        status, body = self._post("/api/cline/login/cancel", {"device_code": "dev-1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_cline_login_poll_reports_done(self):
+        _, body = self._api("/api/cline/login/poll?device_code=dev-1")
+        self.assertEqual(json.loads(body)["state"], "done")
+
+    def test_cline_model_toggle_escapes_upstream_name(self):
+        """上游名含 / 与 :，必须 URL 转义后作为单段路径传给网关（Go mux 只吃一段）。"""
+        status, body = self._post("/api/cline/model/disable",
+                                  {"id": "anthropic/claude-opus-5"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # 问 stub 要回执：它去转义后拿到的必须是原值，说明转义-解转义这一路没走样
+        _, tb = _get("http://127.0.0.1:%d/__toggled" % CLINE_PORT)
+        self.assertIn(["anthropic/claude-opus-5", "disable"],
+                      json.loads(tb)["toggled"])
+
+    def test_cline_model_toggle_requires_id(self):
+        status, body = self._post("/api/cline/model/enable", {})
+        self.assertEqual(status, 400)
+        self.assertIn("id", json.loads(body)["error"])
+
+    def test_cline_account_disable(self):
+        status, body = self._post("/api/cline/account/disable", {"id": "acc_1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_cline_recheck(self):
+        status, body = self._post("/api/cline/recheck", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["started"])
+
+    def test_cline_post_without_csrf_rejected(self):
+        """cline 子面板的状态变更同样要过 CSRF 闸门。"""
+        status, _ = _post("http://127.0.0.1:%d/api/cline/recheck" % CLINE_PANEL_PORT,
+                          {}, csrf=False)
+        self.assertEqual(status, 403)
+
+    def test_single_gateway_deployment_has_no_cline_section(self):
+        """未配置 cline2api 的老部署：cline 路由回 503，页面也不显示该节。"""
+        try:
+            _get("http://127.0.0.1:%d/api/cline/status" % PLAIN_PANEL_PORT)
+            self.fail("应返回 503")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 503)
+            self.assertIn("未配置", e.read().decode("utf-8", "replace"))
+        # 页面里那一节默认 display:none，由 JS 在拿到台账后才显示
+        _, html = _get("http://127.0.0.1:%d/" % PLAIN_PANEL_PORT)
+        self.assertIn('id="clineSection" style="display:none"', html)
+        # wb2a 本体不受影响
+        status, body = _get("http://127.0.0.1:%d/api/status" % PLAIN_PANEL_PORT)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["total"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

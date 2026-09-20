@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""wb2a-panel — workbuddy2api 的轻量 Web 管理面板。
+"""wb2a-panel — workbuddy2api 的轻量 Web 管理面板（可带 cline2api 第二网关）。
 
-设计取舍（三句话）：
+设计取舍（四句话）：
   1. **零依赖**：只用 Python 标准库。不需要 pip install，不需要编译。
   2. **不 fork 网关**：纯外部面板，只通过网关自己的 HTTP 接口工作，
      上游怎么更新都不用跟着改。
   3. **优雅降级**：核心功能（账号池 / 模型目录 / 请求统计 / 停用启用）只需
      网关地址 + api_key；增强功能（新增账号 / 签到 / 领试用 / 实时积分）需要
      与网关同机部署、能调到它的 CLI 工具，检测到才启用。
+  4. **多网关可选**：配置了 cline2api 就多一节「Cline 免费层」（账号池 + 定价闸门
+     台账 + 设备授权登录），没配置则整节不出现，行为与单网关版完全一致。
 
 跑起来：
     python3 panel.py --base http://127.0.0.1:7863 --key sk-xxx
@@ -32,7 +34,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -51,7 +53,8 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 class Config:
     def __init__(self, gateway: str, api_key: str, auth_dir: str, bin_dir: str,
-                 port: int, gateway_config: str = "", host: str = "127.0.0.1"):
+                 port: int, gateway_config: str = "", host: str = "127.0.0.1",
+                 cline: dict | None = None):
         self.gateway = gateway.rstrip("/")
         self.api_key = api_key
         self.auth_dir = Path(auth_dir).expanduser() if auth_dir else None
@@ -59,6 +62,9 @@ class Config:
         self.port = port
         self.gateway_config = gateway_config
         self.host = host
+        # 第二网关（cline2api）: {"base", "api_key", "admin_token", "config_path"}。
+        # None 时面板行为与单网关版完全一致（老部署零改动）。
+        self.cline = cline or None
 
     @property
     def exposed(self) -> bool:
@@ -203,7 +209,48 @@ def load_config(args) -> Config:
     port = args.port or int(os.environ.get("WB2A_PANEL_PORT") or panel_cfg.get("port") or DEFAULT_PORT)
     host = pick(args.host, "WB2A_PANEL_HOST", "host", DEFAULT_HOST)
 
-    return Config(base, api_key, auth_dir, bin_dir, port, gw_cfg_path, host)
+    cline = load_cline_config(args, panel_cfg)
+
+    return Config(base, api_key, auth_dir, bin_dir, port, gw_cfg_path, host, cline)
+
+
+def load_cline_config(args, panel_cfg: dict) -> dict | None:
+    """第二网关（cline2api）的连接参数。没配置就返回 None（面板退回单网关形态）。
+
+    与 wb2a 一样走四级发现：命令行 > 环境变量 > panel.json > cline2api 的 config.json。
+    最后一级能自动凑齐：listen→base、api_key、admin_token 都在它的 config.json 里。
+    """
+    explicit = (getattr(args, "cline_config", "") or os.environ.get("CLINE2API_CONFIG", "")
+                or panel_cfg.get("cline_config") or "")
+    cfg_path = Path(explicit).expanduser() if explicit else Path("/opt/cline2api/config.json")
+    gw = {}
+    if cfg_path.is_file():
+        try:
+            gw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print("! 读取 cline2api 配置失败（%s）：%s" % (cfg_path, e), file=sys.stderr, flush=True)
+
+    def pick(cli_value, env_name, cfg_key, fallback=""):
+        if cli_value:
+            return cli_value
+        env = os.environ.get(env_name, "").strip()
+        if env:
+            return env
+        if cfg_key in panel_cfg and panel_cfg[cfg_key]:
+            return panel_cfg[cfg_key]
+        return fallback
+
+    base = pick(getattr(args, "cline_base", ""), "CLINE2API_BASE", "cline_base")
+    if not base and gw.get("listen"):
+        base = normalize_listen(gw["listen"])
+    api_key = pick(getattr(args, "cline_key", ""), "CLINE2API_API_KEY", "cline_api_key",
+                   gw.get("api_key", ""))
+    admin = pick(getattr(args, "cline_admin_token", ""), "CLINE2API_ADMIN_TOKEN",
+                 "cline_admin_token", gw.get("admin_token", "") or api_key)
+    if not base or not admin:
+        return None
+    return {"base": base.rstrip("/"), "api_key": api_key, "admin_token": admin,
+            "config_path": str(cfg_path) if cfg_path.is_file() else ""}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -561,12 +608,99 @@ class Panel:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# cline2api 网关（第二上游：Cline 账号池，OpenAI 兼容）
+# ──────────────────────────────────────────────────────────────────────
+
+class ClinePanel:
+    """cline2api 的展示与操作入口。
+
+    与 wb2a 的差别：它的「运营决策存储位」是定价闸门台账，所以面板这边提供的是
+    账号池 + 闸门台账（模型启停）两类操作，外加设备授权登录代理。
+    鉴权分两套：/v1/* 用 api_key，/status 与 /admin/* 用 admin_token。
+    """
+
+    def __init__(self, cfg: dict):
+        self.base = cfg["base"].rstrip("/")
+        self.api_key = cfg.get("api_key", "")
+        self.admin_token = cfg.get("admin_token", "")
+        self.config_path = cfg.get("config_path", "")
+
+    def _req(self, method: str, path: str, body=None, token=None, timeout=30):
+        headers = {"Authorization": "Bearer " + (token or self.admin_token)}
+        return http(method, self.base + path, body, headers, timeout)
+
+    # — 读 —————————————————————————————————————————————
+    def status(self):
+        code, st = self._req("GET", "/status", timeout=15)
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, extract_error_message(st) or str(st)[:160])}
+        if isinstance(st, dict):
+            st["gateway"] = self.base
+            st["api_key"] = self.api_key
+        return st
+
+    def models(self):
+        """对外可服务的上游模型名（闸门放行的）。"""
+        code, res = self._req("GET", "/v1/models", token=self.api_key, timeout=15)
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, str(res)[:160])}
+        return {"data": (res or {}).get("data", [])}
+
+    # — 写 —————————————————————————————————————————————
+    def login_start(self):
+        code, res = self._req("POST", "/admin/login/start")
+        if code != 200:
+            return {"error": "发起登录失败：%s" % (extract_error_message(res) or str(res)[:160])}
+        return res if isinstance(res, dict) else {"error": str(res)}
+
+    def login_poll(self, device_code: str):
+        code, res = self._req("GET", "/admin/login/poll?device_code="
+                              + urllib.parse.quote(device_code, safe=""))
+        if code != 200:
+            return {"state": "error", "error": extract_error_message(res) or str(res)[:160]}
+        return res if isinstance(res, dict) else {"state": "error", "error": str(res)}
+
+    def login_cancel(self, device_code: str):
+        # cline2api 的 cancel 从 query 读 device_code（不是 body）
+        code, res = self._req("POST", "/admin/login/cancel?device_code="
+                              + urllib.parse.quote(device_code, safe=""))
+        if code != 200:
+            return {"error": str(res)[:160]}
+        return {"ok": True}
+
+    def model_op(self, enable: bool, model_id: str, reason: str = "") -> dict:
+        # 上游名含 / 与 :，必须转义成单段——Go 1.22 ServeMux 的 {id} 只吃一段
+        quoted = urllib.parse.quote(model_id, safe="")
+        action = "enable" if enable else "disable"
+        payload = json.dumps({"reason": reason or "panel"}).encode()
+        code, res = self._req("POST", "/admin/models/%s/%s" % (quoted, action), payload)
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, extract_error_message(res) or str(res)[:160])}
+        return {"ok": True, "model": model_id, "enabled": enable}
+
+    def account_op(self, enable: bool, account_id: str) -> dict:
+        quoted = urllib.parse.quote(account_id, safe="")
+        action = "enable" if enable else "disable"
+        code, res = self._req("POST", "/admin/accounts/%s/%s" % (quoted, action))
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, extract_error_message(res) or str(res)[:160])}
+        return {"ok": True, "account": account_id, "enabled": enable}
+
+    def recheck(self):
+        code, res = self._req("POST", "/admin/gate/recheck")
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, str(res)[:160])}
+        return {"ok": True, "started": True}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # HTTP 服务
 # ──────────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "wb2a-panel/" + __version__
     panel: Panel = None                      # 由 main 注入
+    cline: "ClinePanel" = None               # 由 main 注入；未配置 cline2api 时 None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[panel] %s %s\n" % (self.command, self.path.split("?")[0]))
@@ -619,6 +753,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login/status":
             with p._lock:
                 return self._send(200, dict(p.session))
+        if path.startswith("/api/cline/"):
+            return self._cline_get(path)
+        return self._send(404, {"error": "not found"})
+
+    def _cline(self):
+        """cline2api 子面板；未配置时统一回一个可读的错误。"""
+        if self.cline is None:
+            return None, self._send(503, {"error": "面板未配置 cline2api（缺 base/admin_token）。"
+                                                   "用 --cline-config 指向它的 config.json，"
+                                                   "或设 CLINE2API_CONFIG 环境变量。"})
+        return self.cline, None
+
+    def _cline_get(self, path: str):
+        c, err = self._cline()
+        if c is None:
+            return err
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        if path == "/api/cline/status":
+            return self._send(200, c.status())
+        if path == "/api/cline/models":
+            return self._send(200, c.models())
+        if path == "/api/cline/login/poll":
+            return self._send(200, c.login_poll((q.get("device_code") or [""])[0]))
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -651,6 +808,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p.run_tool("signin_bin"))
         if path == "/api/trial":
             return self._send(200, p.run_tool("trial_bin"))
+        if path.startswith("/api/cline/"):
+            c, err = self._cline()
+            if c is None:
+                return err
+            return self._cline_post(path, body)
+        return self._send(404, {"error": "not found"})
+
+    def _cline_post(self, path: str, body: dict):
+        c = self.cline
+        if path == "/api/cline/login/start":
+            return self._send(200, c.login_start())
+        if path == "/api/cline/login/cancel":
+            return self._send(200, c.login_cancel(body.get("device_code") or ""))
+        if path == "/api/cline/recheck":
+            return self._send(200, c.recheck())
+        if path in ("/api/cline/model/enable", "/api/cline/model/disable"):
+            mid = (body.get("id") or "").strip()
+            if not mid:
+                return self._send(400, {"error": "缺少 id"})
+            return self._send(200, c.model_op(path.endswith("enable"), mid, body.get("reason") or ""))
+        if path in ("/api/cline/account/enable", "/api/cline/account/disable"):
+            aid = (body.get("id") or "").strip()
+            if not aid:
+                return self._send(400, {"error": "缺少 id"})
+            return self._send(200, c.account_op(path.endswith("enable"), aid))
         return self._send(404, {"error": "not found"})
 
 
@@ -672,6 +854,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--auth-dir", help="账号凭据目录（启用「新增账号」需要）")
     ap.add_argument("--bin-dir", help="网关程序目录（含 login/credit 等工具）")
     ap.add_argument("--gateway-config", help="网关 config.json 路径（默认自动探测）")
+    ap.add_argument("--cline-config",
+                    help="cline2api 网关的 config.json 路径（默认 /opt/cline2api/config.json）")
+    ap.add_argument("--cline-base", help="cline2api 网关地址（覆盖配置文件）")
+    ap.add_argument("--cline-key", help="cline2api 的 api_key（覆盖配置文件）")
+    ap.add_argument("--cline-admin-token", help="cline2api 的 admin_token（覆盖配置文件）")
     ap.add_argument("--config", help="面板自己的配置（默认 ./panel.json，可无）")
     ap.add_argument("--port", type=int, help="面板监听端口（默认 %d）" % DEFAULT_PORT)
     ap.add_argument("--host", default=None,
@@ -716,6 +903,19 @@ def main(argv=None) -> int:
         print("  配置来自 %s" % cfg.gateway_config, flush=True)
     print("  增强功能：%s" % ("、".join(caps) if caps else "无（核心功能可用；"
           "把面板部署到网关同机可解锁新增账号/签到/实时积分）"), flush=True)
+
+    # cline2api 是可选第二网关：连不上只提示，不影响 wb2a 面板可用
+    if cfg.cline:
+        Handler.cline = ClinePanel(cfg.cline)
+        cst = Handler.cline.status()
+        if isinstance(cst, dict) and cst.get("error"):
+            print("⚠ cline2api 子面板不可用（%s）：%s" % (cfg.cline["base"], cst["error"]),
+                  file=sys.stderr, flush=True)
+        else:
+            print("✓ 已连接 cline2api %s（%s 个账号、%s 个模型暴露）" % (
+                cfg.cline["base"], cst.get("accounts_total", "?"),
+                sum(1 for m in (cst.get("models") or []) if m.get("exposed"))), flush=True)
+
     print("✓ 面板地址：http://127.0.0.1:%d" % cfg.port, flush=True)
     if cfg.exposed:
         print("⚠ 正在监听 %s（局域网可访问）。面板持有网关 api_key，"

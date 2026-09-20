@@ -10,7 +10,7 @@
 
 ---
 
-## 为什么是这三个取舍
+## 为什么是这几个取舍
 
 现有面板要么是网关的 fork（上游更新一版就得跟一次），要么需要 Go 编译或
 `npm install`。这个面板刻意走另一条路：
@@ -20,6 +20,7 @@
 | **零依赖** | 只用 Python 标准库。不用 `pip install`，不用编译，不用构建。把两个文件拷过去就能跑。 |
 | **不 fork 网关** | 纯外部面板，只通过网关自己的 HTTP 接口工作。上游怎么更新都不用跟着改，也不会因为面板引入的改动影响网关稳定性。 |
 | **优雅降级** | 核心功能只要「网关地址 + api_key」就能用；增强功能需要与网关同机部署（要调它的 CLI），检测不到就禁用按钮并说明原因，而不是点了才报错。 |
+| **多网关可选** | 配了 cline2api 就在同页多一节（账号池 + 定价闸门台账 + 设备授权登录）；没配则整节不出现，与单网关版行为一致。 |
 
 ## 快速开始
 
@@ -60,6 +61,10 @@ WB2A_API_KEY=sk-your-key docker compose up -d
 | `--auth-dir` | `WB2A_AUTH_DIR` | 账号凭据目录（启用「新增账号」需要） |
 | `--bin-dir` | `WB2A_BIN_DIR` | 网关程序目录，含 `login`/`credit` 等工具 |
 | `--gateway-config` | `WB2A_CONFIG` | 网关 config.json 路径（默认自动探测） |
+| `--cline-config` | `CLINE2API_CONFIG` | cline2api 的 config.json（默认 `/opt/cline2api/config.json`） |
+| `--cline-base` | `CLINE2API_BASE` | cline2api 网关地址 |
+| `--cline-key` | `CLINE2API_API_KEY` | cline2api 的 api_key |
+| `--cline-admin-token` | `CLINE2API_ADMIN_TOKEN` | cline2api 的 admin_token |
 | `--config` | — | 面板自己的配置（默认 `./panel.json`，见 `panel.example.json`） |
 | `--port` | `WB2A_PANEL_PORT` | 面板端口（默认 8321） |
 | `--host` | `WB2A_PANEL_HOST` | 面板监听地址（默认 `127.0.0.1`，仅本机可访问） |
@@ -90,6 +95,32 @@ WB2A_API_KEY=sk-your-key docker compose up -d
 
 检测不到的增强功能会在页面上给出说明和替代方案（直接用网关自带的
 `./login.sh` / `./signin.sh`，效果相同）。
+
+### Cline 免费层（配置了 cline2api 时）
+
+面板可以为第二个上游网关渲染一节独立区块，把 cline2api 的账号池与定价闸门
+台账放在同一页上：
+
+- **账号池** — 每个 Cline 账号的状态、请求数、token 量、冷却原因，以及临时停用/恢复
+- **模型台账** — 每个模型的分组、闸门状态（免费档 / 已放行 / 待探针 / 已关停）、
+  最近与累计的计费成本、关停原因；可按模型手动启停
+- **设备授权登录** — 面板代理 Cline 的 WorkOS 设备流，给出授权地址与代码，
+  浏览器里点一次就完成加号（凭据落在网关侧，不过面板）
+
+配置四级发现与 wb2a 同构：命令行 > 环境变量 > `panel.json` > cline2api 的 `config.json`。
+最后一级通常就够了 —— `listen` / `api_key` / `admin_token` 都在那个文件里：
+
+```bash
+# 云端同机部署：指向它的 config.json 即可，无需另传密钥
+python3 panel.py --cline-config /opt/cline2api/config.json
+```
+
+**闸门语义**：面板里「已关停」的模型通常是正常保护结果，不是故障 ——
+闸门观测到上游开始计费（`cost>0`）、或上游回 402/403 计费错误，就会自动摘除该模型。
+手动启用只是解除手动关停标记，仍受运行期成本观测约束（成本永远赢）。
+
+未配置 cline2api 时，`/api/cline/*` 返回 503，页面上那一节不出现 ——
+老部署升级后行为与单网关版完全一致。
 
 ## 两个值得注意的设计
 
@@ -132,9 +163,14 @@ WB2A_API_KEY=sk-your-key docker compose up -d
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -v      # 51 个测试（36 单元 + 15 冒烟）
+python3 -m unittest discover -s tests -v      # 62 个测试（36 单元 + 26 冒烟）
 python3 tests/stub_gateway.py --port 7999 &   # 假网关，用于本地调面板
 python3 panel.py --base http://127.0.0.1:7999 --key test
+
+# 带 cline2api 子面板（假 cline2api 也备好了）
+python3 tests/stub_cline.py --port 7998 &
+python3 panel.py --base http://127.0.0.1:7999 --key test \
+  --cline-base http://127.0.0.1:7998 --cline-key stub-key --cline-admin-token stub-admin
 ```
 
 零依赖也让这件事很省事：测试用标准库 `unittest`，CI 不需要 `pip install`。
