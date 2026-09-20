@@ -34,7 +34,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -224,9 +224,17 @@ def load_cline_config(args, panel_cfg: dict) -> dict | None:
                 or panel_cfg.get("cline_config") or "")
     cfg_path = Path(explicit).expanduser() if explicit else Path("/opt/cline2api/config.json")
     gw = {}
-    if cfg_path.is_file():
+    if cfg_path.exists():
         try:
             gw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except PermissionError as e:
+            # 这是最容易被静默吞掉的一种失败：文件存在、路径对，只是本进程读不到。
+            # 表现为「面板未配置 cline2api」，跟没部署这个网关长得一样，很难查。
+            # cline2api 的 deploy 脚本每次都重设权限，所以务必说清怎么办。
+            print("✗ 读不到 cline2api 配置 %s：%s" % (cfg_path, e), file=sys.stderr, flush=True)
+            print("  该文件应是 640 且属组含本进程用户（面板以 wb2a 运行、属 cline2api 组）。"
+                  "修：sudo chgrp cline2api %s && sudo chmod 640 %s" % (cfg_path, cfg_path),
+                  file=sys.stderr, flush=True)
         except (OSError, ValueError) as e:
             print("! 读取 cline2api 配置失败（%s）：%s" % (cfg_path, e), file=sys.stderr, flush=True)
 
@@ -915,6 +923,11 @@ def main(argv=None) -> int:
             print("✓ 已连接 cline2api %s（%s 个账号、%s 个模型暴露）" % (
                 cfg.cline["base"], cst.get("accounts_total", "?"),
                 sum(1 for m in (cst.get("models") or []) if m.get("exposed"))), flush=True)
+    else:
+        # 别让「没配」和「配了但读不到」都静默走同一条路：
+        # 后者是权限问题，只会在页面上表现成整块 cline 区域消失，很难联想到原因。
+        print("  第二网关 cline2api：未配置（用 --cline-config 指定其 config.json 可启用）",
+              file=sys.stderr, flush=True)
 
     print("✓ 面板地址：http://127.0.0.1:%d" % cfg.port, flush=True)
     if cfg.exposed:

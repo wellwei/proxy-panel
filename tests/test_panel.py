@@ -393,5 +393,82 @@ class TestHttpHelper(unittest.TestCase):
         self.assertIn("error", body)
 
 
+class TestLoadClineConfig(unittest.TestCase):
+    """cline2api 连接参数的四级发现。
+
+    最值得锁住的是「文件在、但读不到」——它和「没部署这个网关」在页面上表现
+    完全一样（整块 cline 区域消失），曾因 cline2api 的部署脚本把 config.json
+    设成 600 而真实踩过一次。
+    """
+
+    class _Args:
+        cline_config = ""
+        cline_base = ""
+        cline_key = ""
+        cline_admin_token = ""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "cline.json"
+        self.cfg.write_text(json.dumps({
+            "listen": "127.0.0.1:8081", "api_key": "k-from-file",
+            "admin_token": "a-from-file",
+        }), encoding="utf-8")
+
+    def _load(self, **over):
+        args = self._Args()
+        for k, v in over.items():
+            setattr(args, k, v)
+        return panel.load_cline_config(args, {})
+
+    def test_reads_from_gateway_config(self):
+        c = self._load(cline_config=str(self.cfg))
+        self.assertEqual(c["base"], "http://127.0.0.1:8081")   # listen 归一化
+        self.assertEqual(c["api_key"], "k-from-file")
+        self.assertEqual(c["admin_token"], "a-from-file")
+
+    def test_cli_overrides_file(self):
+        c = self._load(cline_config=str(self.cfg), cline_base="http://10.0.0.9:9000",
+                       cline_admin_token="cli-admin")
+        self.assertEqual(c["base"], "http://10.0.0.9:9000")
+        self.assertEqual(c["admin_token"], "cli-admin")
+        self.assertEqual(c["api_key"], "k-from-file")   # 未覆盖的仍读文件
+
+    def test_admin_token_falls_back_to_api_key(self):
+        """admin_token 缺省时退用 api_key（老版本 cline2api 只有一个密钥）。"""
+        self.cfg.write_text(json.dumps({"listen": ":8081", "api_key": "only"}),
+                            encoding="utf-8")
+        c = self._load(cline_config=str(self.cfg))
+        self.assertEqual(c["admin_token"], "only")
+
+    def test_unreadable_config_reports_and_disables(self):
+        """读不到（权限）时必须明确报错，而不是静默当成「没配置」。"""
+        if os.geteuid() == 0:
+            self.skipTest("root 无视文件权限，测不了这个场景")
+        self.cfg.chmod(0o000)
+        self.addCleanup(self.cfg.chmod, 0o600)
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = self._load(cline_config=str(self.cfg))
+        self.assertIsNone(c)
+        msg = err.getvalue()
+        self.assertIn("读不到", msg)
+        self.assertIn("chmod 640", msg)      # 要给出可执行的修复命令
+        self.assertIn(str(self.cfg), msg)
+
+    def test_missing_config_is_silent_none(self):
+        """真没这个文件时安静返回 None（老部署不该刷错误）。"""
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = self._load(cline_config=str(Path(self.tmp.name) / "nope.json"))
+        self.assertIsNone(c)
+        self.assertEqual(err.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

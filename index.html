@@ -110,18 +110,49 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
 .toast.on{opacity:1}
 .panel{display:none;margin-bottom:22px}
 .panel.on{display:block}
+/* ── 网关切换 ────────────────────────────────────────────────────────
+   两个上游网关(workbuddy2api / cline2api)各自一页：混在同一页时要靠滚动和
+   标题去分辨「这条是哪个网关的」，账号与模型还会挤在同一个网格里。 */
+.tabs{display:flex;gap:4px;margin:20px 0 22px;border-bottom:1px solid var(--border)}
+.tab{background:transparent;border:none;border-bottom:2px solid transparent;border-radius:0;
+  padding:10px 18px;font-weight:600;color:var(--muted);
+  display:flex;align-items:center;gap:8px;margin-bottom:-1px}
+.tab:hover:not(:disabled){color:var(--fg);border-bottom-color:var(--border)}
+.tab.on{color:var(--accent);border-bottom-color:var(--accent)}
+.tab.on.cline{color:var(--cline);border-bottom-color:var(--cline)}
+.tab-badge{font-size:11px;padding:1px 7px;border-radius:99px;background:var(--chip);
+  color:var(--muted);font-weight:600;white-space:nowrap}
+.tab.on .tab-badge{background:var(--accent);color:var(--accent-fg)}
+.tab.on.cline .tab-badge{background:var(--cline);color:#fff}
+.pane{display:none}
+.pane.on{display:block}
+/* 页内分区标题：把一个网关里的「账号池」和「模型」分开，不再混成一个网格 */
+.sect{display:flex;align-items:center;gap:10px;margin:6px 0 4px;font-size:15.5px;font-weight:600}
+.sect.sep{margin-top:34px;padding-top:22px;border-top:1px solid var(--border)}
+.sect-hint{color:var(--muted);font-size:12.5px;margin:0 0 14px}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <h1>workbuddy2api 管理面板</h1>
-      <div class="sub" id="subline">账号池 · 模型目录 · 请求统计</div>
+      <h1>网关管理面板</h1>
+      <div class="sub" id="subline">两个上游网关，各自一页独立管理</div>
     </div>
-    <button class="sm" onclick="loadAll(true)">刷新</button>
+    <button class="sm" onclick="refreshActive(true)">刷新</button>
   </header>
 
+  <!-- 网关切换：切页只加载当前网关，互不干扰 -->
+  <div class="tabs" id="gwTabs">
+    <button class="tab on" data-gw="wb2a" onclick="switchGw('wb2a')">
+      workbuddy2api <span class="tab-badge" id="badgeWb2a">…</span>
+    </button>
+    <button class="tab" data-gw="cline" id="tabCline" onclick="switchGw('cline')">
+      cline2api <span class="tab-badge" id="badgeCline">…</span>
+    </button>
+  </div>
+
+  <div class="pane on" id="pane-wb2a">
   <div class="summary" id="summary"></div>
 
   <div class="card" id="endpointCard" style="margin-bottom:18px">
@@ -141,26 +172,6 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
       <pre id="epSample" style="margin:8px 0 0;white-space:pre-wrap;word-break:break-all;
         font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--muted)"></pre>
     </details>
-  </div>
-
-  <!-- ── cline2api 子面板（第二个上游网关；未配置时整块隐藏）────── -->
-  <div id="clineSection" style="display:none">
-    <div class="chead" style="margin:26px 0 12px">
-      <span class="name" style="color:var(--cline)">cline2api · Cline 免费层</span>
-      <span class="tag" id="clineState">…</span>
-      <button class="sm" style="margin-left:auto" onclick="loadCline()">刷新</button>
-    </div>
-    <div class="summary" id="clineSummary"></div>
-
-    <div class="warnbox">
-      <b>定价闸门</b>：recommended 组模型先探针后放行（cost=0 才入池），每次真实响应复核
-      上游计费成本，一旦 &gt;0 立即自动关停并从这里摘除——所以下面「已关停」的模型是
-      <b>正常保护结果</b>，不是故障。手动启用仍受运行期成本观测约束（成本永远赢）。
-    </div>
-
-    <div class="bar" id="clineBar" style="margin:14px 0 16px"></div>
-
-    <div class="grid" id="clineModels"></div>
   </div>
 
   <div class="bar">
@@ -217,6 +228,56 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
   </div>
 
   <div class="grid" id="grid"></div>
+  </div><!-- /pane-wb2a -->
+
+  <!-- ── cline2api 网关（独立一页；面板未配置它时连标签一起隐藏）────── -->
+  <div class="pane" id="pane-cline">
+    <div class="card" style="margin-bottom:18px">
+      <div class="chead">
+        <span class="name">接入信息</span>
+        <span class="tag" id="clineState">…</span>
+      </div>
+      <div class="kv" style="grid-template-columns:auto 1fr auto;align-items:center">
+        <span class="k">Base URL</span><span class="v" id="clineBase">…</span>
+        <button class="sm" onclick="copyEp('clineBase')">复制</button>
+        <span class="k">API Key</span><span class="v" id="clineKey">…</span>
+        <button class="sm" onclick="copyEp('clineKey')">复制</button>
+      </div>
+      <div class="meta" style="margin-top:8px">
+        本网关只绑回环，由 new-api 经 <code>127.0.0.1:8081</code> 以 priority=102
+        渠道接入；日常调用走 new-api，不直接用这个地址。
+      </div>
+    </div>
+
+    <div class="summary" id="clineSummary"></div>
+
+    <div class="bar" id="clineBar"></div>
+
+    <div class="warnbox">
+      <b>定价闸门</b>：模型先探针后放行（cost=0 才入池），每条真实响应复核上游计费成本，
+      一旦 &gt;0 立即自动关停并摘出渠道 —— 所以「已关停」是<b>正常保护结果</b>，不是故障。
+      手动启用仍受运行期成本观测约束（成本永远赢）。
+    </div>
+
+    <div class="sect" style="margin-top:22px">
+      <span>账号池</span>
+      <span class="tag" id="clineAcctTag">…</span>
+    </div>
+    <div class="sect-hint">
+      Cline 免费额度按账号限量，多号摊薄。这里的启停只影响本网关选号，不动凭据。
+    </div>
+    <div class="grid" id="clineAccounts"></div>
+
+    <div class="sect sep">
+      <span>定价闸门台账</span>
+      <span class="tag" id="clineModelTag">…</span>
+    </div>
+    <div class="sect-hint">
+      闸门放行/关停就是这条渠道的运营决策存储位 —— 在这里启停模型，约 2 分钟内
+      自动调和进 new-api 渠道（改完刷新即可看到状态，不必手动同步）。
+    </div>
+    <div class="grid" id="clineModels"></div>
+  </div>
 </div>
 
 <div class="modal" id="loginModal">
@@ -250,6 +311,11 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
 
 <script>
 let ST = null, EP = null, TIMER = null, CURRENT = null;
+// 登录弹窗属于哪个网关：两个网关的取消接口不同，共用弹窗时必须记住来源，
+// 否则在 cline 里点取消会去取消 wb2a 的会话（对面没这个会话，等于没取消）。
+let LOGIN_KIND = 'wb2a';
+// 当前选中的网关页。每轮只刷新当前页 —— 这正是拆成两页的意义。
+let GW = 'wb2a';
 // 面板 API 基址从当前路径推导，而不是写死 /api：
 // 这样面板既能直接挂在根路径，也能挂在反向代理的子路径下（如 /panel/）。
 const API_BASE = location.pathname.replace(/\/[^/]*$/, '') + '/api';
@@ -275,11 +341,39 @@ async function api(path, opts) {
 const isZeroTime = s => !s || String(s).startsWith('0001-01-01');
 const fmtTime = s => isZeroTime(s) ? '—' : String(s).slice(5, 16).replace('T', ' ');
 
+function updateSubline() {
+  // 副标题反映当前页：切到 cline 页还显示 wb2a 的地址会误导（那不是 cline 的接入点）
+  const e = EP || {};
+  const cline = GW === 'cline';
+  const gw = cline ? ($('clineBase').textContent || '') : (e.gateway || '');
+  $('subline').innerHTML = cline
+    ? `账号池 · 定价闸门台账　网关 <code>${esc(gw)}</code>`
+    : `账号池 · 模型目录 · 请求统计　网关 <code>${esc(gw)}</code>`;
+}
+
 function toggle(id, btn, name) {
   const el = $(id), on = el.classList.toggle('on');
   btn.textContent = (on ? '收起' : '查看') + name;
   if (on && id === 'modelPanel' && !$('modelBody').dataset.loaded) loadModels();
   if (on && id === 'statsPanel') loadStats();
+}
+
+// ── 网关切换 ──────────────────────────────────────────────────────────
+function switchGw(name, silent) {
+  GW = name;
+  document.querySelectorAll('#gwTabs .tab').forEach(t =>
+    t.classList.toggle('on', t.dataset.gw === name));
+  document.querySelectorAll('.pane').forEach(p =>
+    p.classList.toggle('on', p.id === 'pane-' + name));
+  // 切页时才首次加载对面，避免进页面就打两个网关
+  if (!silent && name === 'wb2a' && !ST) loadAll();
+  if (!silent && name === 'cline') loadCline();
+  updateSubline();
+}
+
+function refreshActive(loud) {
+  if (GW === 'cline') loadCline();
+  else loadAll(loud);
 }
 
 // ── 渲染 ──────────────────────────────────────────────────────────────
@@ -300,6 +394,9 @@ function render() {
     <div class="stat"><div class="k">剩余积分</div><div class="v">${credit != null ? credit : '—'}${
       size ? `<span style="font-size:12px;color:var(--muted);font-weight:400"> / ${size}</span>` : ''}</div></div>
     <div class="stat"><div class="k">异常</div><div class="v" style="color:${bad ? 'var(--err)' : 'inherit'}">${bad}</div></div>`;
+
+  // 标签页徽标：切到别的页时也能一眼看到本网关是否正常
+  $('badgeWb2a').textContent = `${accts.length} 账号 · ${healthy} 健康`;
 
   if (!accts.length) {
     $('grid').innerHTML = '<div class="empty">账号池是空的。用上面的「新增账号」，'
@@ -374,7 +471,8 @@ async function loadEndpoint() {
   $('epBase').textContent = e.base_url;
   $('epKey').textContent = e.api_key;
   const caps = e.capabilities || {};
-  $('subline').innerHTML = `账号池 · 模型目录 · 请求统计　网关 <code>${esc(e.gateway)}</code>`;
+  // 副标题跟着当前页走（见 updateSubline）：在 cline 页上印 wb2a 的地址是错的
+  updateSubline();
   // 内网地址只在面板确实对外监听时才印出来；否则给出不含具体地址的通用提示
   //（内网地址属于拓扑信息，不该默认展示 —— 截图/投屏时容易外泄）。
   const lan = (e.base_url_lan.match(/\/\/([^:]+):/) || [])[1];
@@ -588,7 +686,7 @@ async function finishLogin(msg) {
   $('d3').className = 'dot done'; $('d3').textContent = '✓';
   $('s3').textContent = msg;
   toast(msg, 5000);
-  await loadAll();
+  if (LOGIN_KIND === 'cline') loadCline(); else await loadAll();
   setTimeout(closeLogin, 1800);
 }
 
@@ -596,8 +694,17 @@ function closeLogin() {
   clearInterval(TIMER);
   CURRENT = null;
   $('loginModal').classList.remove('on');
-  fetch(API_BASE + '/login/cancel',
-        {method: 'POST', headers: {'X-Panel-Request': '1'}}).catch(() => {});
+  // 取消要打给发起登录的那个网关：两边接口路径不同（wb2a 是 /login/cancel，
+  // cline2api 还带 device_code）。打错等于没取消，对面会话会一直挂着。
+  const url = LOGIN_KIND === 'cline'
+    ? '/cline/login/cancel' : '/login/cancel';
+  const body = LOGIN_KIND === 'cline'
+    ? JSON.stringify({device_code: CLINE_DEVICE}) : undefined;
+  fetch(API_BASE + url, {method: 'POST', body,
+        headers: {'X-Panel-Request': '1', 'Content-Type': 'application/json'}})
+    .catch(() => {});
+  LOGIN_KIND = 'wb2a';
+  CLINE_DEVICE = '';
 }
 
 document.querySelectorAll('.modal').forEach(m => {
@@ -613,27 +720,36 @@ const GATE_LABEL = {
   unverified: ['待探针', 'warn'], disabled: ['已关停', 'err'],
 };
 let CLINE_OFF = false;   // 面板未配置 cline2api 时置位，停止轮询
+let CLINE_DEVICE = '';   // cline 登录会话的 device_code（取消时要用）
 
 async function loadCline() {
   // 未配置 cline2api 的部署：后端一律 503。记住这一点后就不再轮询——
-  // 否则每 15 秒一次 503 只会在网关日志里刷屏，页面反正也没有可显示的东西。
+  // 否则每 15 秒一次 503 只会在网关日志里刷屏，标签页也一并隐藏。
   if (CLINE_OFF) return;
   const st = await api('/cline/status');
   if (!st || st.error) {
-    if (st && st.error && String(st.error).includes('未配置')) { CLINE_OFF = true; return; }
+    if (st && st.error && String(st.error).includes('未配置')) {
+      CLINE_OFF = true;
+      $('tabCline').style.display = 'none';   // 单网关部署：连标签都不出现
+      if (GW === 'cline') switchGw('wb2a', true);
+      return;
+    }
     if (st && st.error) {
-      $('clineSection').style.display = '';
       $('clineState').textContent = '不可用';
-      $('clineModels').innerHTML = `<div class="empty">读取失败：${esc(st.error)}</div>`;
+      $('clineSummary').innerHTML = `<div class="empty">读取失败：${esc(st.error)}</div>`;
     }
     return;
   }
-  $('clineSection').style.display = '';
   const accts = st.accounts || [];
   const exposed = (st.models || []).filter(m => m.exposed);
   const disabled = (st.models || []).filter(m => m.state === 'disabled');
   const pending = (st.models || []).filter(m => m.state === 'unverified');
-  $('clineState').textContent = `${accts.length} 账号 · ${exposed.length} 模型在服`;
+
+  $('badgeCline').textContent = `${accts.length} 账号 · ${exposed.length} 在服`;
+  $('clineState').textContent = `${st.accounts_available ?? 0}/${accts.length} 账号可用`;
+  $('clineBase').textContent = st.gateway || '—';
+  $('clineKey').textContent = st.api_key || '—';
+  updateSubline();
 
   $('clineSummary').innerHTML = `
     <div class="stat"><div class="k">账号总数</div><div class="v">${st.accounts_total ?? accts.length}</div></div>
@@ -645,13 +761,13 @@ async function loadCline() {
     <div class="stat"><div class="k">待探针</div><div class="v" style="color:${
       pending.length ? 'var(--warn)' : 'inherit'}">${pending.length}</div></div>`;
 
-  const acts = `<div class="acts">
+  $('clineBar').innerHTML = `
     <button class="sm" onclick="clineRecheck()">立即复测全部模型</button>
-    <button class="sm" onclick="clineAdd()">+ 新增 Cline 账号</button>
-  </div>`;
+    <button class="sm primary" onclick="clineAdd()">+ 新增 Cline 账号</button>`;
 
-  $('clineBar').innerHTML = acts;
-  const acctCards = accts.map(a => {
+  // ── 账号池 ──
+  $('clineAcctTag').textContent = `${st.accounts_available ?? 0} 可用 / 共 ${accts.length}`;
+  $('clineAccounts').innerHTML = accts.length ? accts.map(a => {
     const st2 = a.status || 'active';
     const tag = st2 === 'active' ? '<span class="tag cn">可用</span>'
       : st2 === 'cooldown' ? '<span class="tag warn">冷却中</span>'
@@ -674,11 +790,13 @@ async function loadCline() {
           : `<button class="sm" onclick="clineAcct(false,'${esc(a.accountId)}')">临时停用</button>`}
       </div>
     </div>`;
-  }).join('');
+  }).join('') : '<div class="empty">账号池是空的。点上方「+ 新增 Cline 账号」用浏览器授权一次即可。</div>';
 
+  // ── 闸门台账 ──
+  $('clineModelTag').textContent = `${exposed.length} 在服 / 共 ${(st.models || []).length}`;
   const sorted = (st.models || []).slice().sort((x, y) =>
     (x.exposed === y.exposed ? 0 : x.exposed ? -1 : 1) || String(x.bare).localeCompare(String(y.bare)));
-  const modelCards = sorted.map(m => {
+  $('clineModels').innerHTML = sorted.length ? sorted.map(m => {
     const [label, cls] = GATE_LABEL[m.state] || [m.state, ''];
     return `<div class="card ${m.exposed ? '' : 'off'}">
       <div class="chead">
@@ -704,10 +822,7 @@ async function loadCline() {
              <span class="note">启用后先经探针，cost=0 才真正放行</span>`}
       </div>
     </div>`;
-  }).join('');
-
-  $('clineModels').innerHTML = (acctCards + modelCards)
-    || '<div class="empty">闸门台账为空（目录还没同步？）</div>';
+  }).join('') : '<div class="empty">闸门台账为空（目录还没同步？）</div>';
 }
 
 async function clineModel(enable, id) {
@@ -735,6 +850,8 @@ async function clineAdd() {
     toast('发起登录失败：' + ((r && r.error) || '无返回'), 5000);
     return;
   }
+  LOGIN_KIND = 'cline';          // 取消时据此打对应的取消接口
+  CLINE_DEVICE = r.device_code || '';
   $('lmTitle').textContent = '新增 Cline 账号';
   $('lmDesc').textContent = '用浏览器完成 Cline 的设备授权，成功后账号自动入池。';
   $('lmUrl').textContent = r.verify_url + (r.user_code ? '　（代码 ' + r.user_code + '）' : '');
@@ -767,15 +884,32 @@ async function clineAdd() {
   }, 3000);
 }
 
-// cline2api 每轮都刷新：面板未配置时它自己会把整节保持隐藏，
-// 所以这里不需要先探测再决定（多一次 if 判断并不能省下这次请求）。
+// 首屏加载当前页（wb2a）+ 轻量拉一次 cline 摘要，只为把标签徽标点亮 ——
+// 徽标的意义就是「不切页也知道对面是否正常」，留个「…」等于没有。
+// 台账与账号卡片仍等切到 cline 页才渲染，不额外加重首屏。
 loadAll();
-if (document.getElementById('clineSection')) loadCline();
+primeBadges();
 setInterval(() => {
   if (CURRENT) return;
-  loadAll();
-  loadCline();
+  refreshActive();
+  primeBadges();
 }, 15000);
+
+// 只取徽标需要的两个数（账号数 / 在服模型数），不碰页面内容
+async function primeBadges() {
+  if (CLINE_OFF) return;
+  const st = await api('/cline/status');
+  if (!st || st.error) {
+    if (st && st.error && String(st.error).includes('未配置')) {
+      CLINE_OFF = true;
+      $('tabCline').style.display = 'none';
+      if (GW === 'cline') switchGw('wb2a', true);
+    }
+    return;
+  }
+  const exposed = (st.models || []).filter(m => m.exposed).length;
+  $('badgeCline').textContent = `${st.accounts_total ?? 0} 账号 · ${exposed} 在服`;
+}
 </script>
 </body>
 </html>

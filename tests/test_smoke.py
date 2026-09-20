@@ -353,17 +353,66 @@ class TestClineSmoke(unittest.TestCase):
                           {}, csrf=False)
         self.assertEqual(status, 403)
 
+    def test_two_gateways_are_separate_tabs(self):
+        """两个网关各自一页：各有独立的容器与统计块，不再混在一个网格里。
+
+        这是本轮改造的核心诉求 —— 之前两个网关的内容在同一页上下堆叠，
+        账号和模型还挤在同一个 grid，分不清哪条属于哪个网关。
+        """
+        _, html = _get("http://127.0.0.1:%d/" % CLINE_PANEL_PORT)
+        for marker in ('id="tabCline"', 'data-gw="wb2a"', 'data-gw="cline"',
+                       'id="pane-wb2a"', 'id="pane-cline"'):
+            self.assertIn(marker, html)
+        # 两页各有自己的汇总块与网格，不再共用
+        self.assertIn('id="summary"', html)
+        self.assertIn('id="clineSummary"', html)
+        self.assertIn('id="grid"', html)
+        self.assertIn('id="clineAccounts"', html)
+        self.assertIn('id="clineModels"', html)
+        # 切换函数与「只刷新当前页」的轮询都在
+        self.assertIn("function switchGw(", html)
+        self.assertIn("refreshActive", html)
+
+    def test_cline_page_splits_accounts_from_models(self):
+        """cline 页内账号池与闸门台账要分区，不能混成一个网格。
+
+        这两类东西语义完全不同（一个是凭据/额度，一个是计费闸门状态），
+        混排会让「模型卡片里混着账号卡片」看起来像数据错乱。
+        """
+        _, html = _get("http://127.0.0.1:%d/" % CLINE_PANEL_PORT)
+        self.assertIn('id="clineAccounts"', html)
+        self.assertIn('id="clineModels"', html)
+        self.assertIn('id="clineAcctTag"', html)
+        self.assertIn('id="clineModelTag"', html)
+        # 两处分别渲染：账号进 clineAccounts、模型进 clineModels
+        self.assertIn("$('clineAccounts').innerHTML", html)
+        self.assertIn("$('clineModels').innerHTML", html)
+
+    def test_cline_page_shows_its_own_endpoint(self):
+        """cline 页要能自证接入信息（base/api_key），否则得去翻配置文件。"""
+        _, html = _get("http://127.0.0.1:%d/" % CLINE_PANEL_PORT)
+        self.assertIn('id="clineBase"', html)
+        self.assertIn('id="clineKey"', html)
+        # 后端把 gateway/api_key 一并放进 /cline/status，前端才有东西可渲染
+        status, body = self._api("/api/cline/status")
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertIn("gateway", d)
+        self.assertIn("api_key", d)
+
     def test_single_gateway_deployment_has_no_cline_section(self):
-        """未配置 cline2api 的老部署：cline 路由回 503，页面也不显示该节。"""
+        """未配置 cline2api 的老部署：cline 路由回 503，页面也不显示其标签页。"""
         try:
             _get("http://127.0.0.1:%d/api/cline/status" % PLAIN_PANEL_PORT)
             self.fail("应返回 503")
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 503)
             self.assertIn("未配置", e.read().decode("utf-8", "replace"))
-        # 页面里那一节默认 display:none，由 JS 在拿到台账后才显示
+        # 标签页默认给 cline 留着但页体是隐藏的；JS 拿到 503 后把标签也隐藏
         _, html = _get("http://127.0.0.1:%d/" % PLAIN_PANEL_PORT)
-        self.assertIn('id="clineSection" style="display:none"', html)
+        self.assertIn('id="tabCline"', html)
+        self.assertIn('id="pane-cline"', html)
+        self.assertIn("CLINE_OFF", html)
         # wb2a 本体不受影响
         status, body = _get("http://127.0.0.1:%d/api/status" % PLAIN_PANEL_PORT)
         self.assertEqual(status, 200)
