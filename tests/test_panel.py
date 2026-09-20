@@ -366,6 +366,9 @@ class TestAccountOp404Split(unittest.TestCase):
 
         srv = HTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        # shutdown() 只停循环，不关监听套接字 —— 不补 server_close() 会在解释器
+        # 退出时刷 unclosed socket 警告，把测试输出盖住。
+        self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         cfg = panel.Config("http://127.0.0.1:%d" % srv.server_port, "k", "", "", 8321)
         return panel.Panel(cfg)

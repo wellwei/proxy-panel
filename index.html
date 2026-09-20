@@ -130,6 +130,24 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
 .sect{display:flex;align-items:center;gap:10px;margin:6px 0 4px;font-size:15.5px;font-weight:600}
 .sect.sep{margin-top:34px;padding-top:22px;border-top:1px solid var(--border)}
 .sect-hint{color:var(--muted);font-size:12.5px;margin:0 0 14px}
+/* ── 任务中心 ────────────────────────────────────────────────────────
+   一键完成成长任务：按钮组 + 逐项进度表 + 可折叠原始日志。
+   这条链路是「面板调网关脚本」，与签到/积分同一条既有通路。 */
+.tgrid{margin-top:12px}
+.tacct{margin-top:14px}
+.tacct-h{display:flex;align-items:center;gap:9px;margin:0 0 7px;font-size:13.5px;font-weight:600}
+.tst{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+.tst th,.tst td{padding:5px 8px;text-align:left;border-bottom:1px solid var(--border)}
+.tst th{color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em}
+.tst td.code{font-family:ui-monospace,Menlo,monospace}
+.tst td.prog{text-align:right;white-space:nowrap}
+.tst td.st{white-space:nowrap}
+.tst tr.hide{display:none}
+.tprog{height:5px;background:var(--chip);border-radius:99px;overflow:hidden;margin:10px 0 8px}
+.tprog > i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .3s}
+.tlog{max-height:320px;overflow:auto;background:var(--chip);border:1px solid var(--border);
+  border-radius:8px;padding:9px 11px;margin-top:8px;
+  font:11.5px/1.6 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -181,6 +199,7 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
     <button id="btnTrial" onclick="runAction('trial','领 Global 试用')">领 Global 试用</button>
     <button onclick="toggle('modelPanel',this,'模型目录')">查看模型目录</button>
     <button onclick="toggle('statsPanel',this,'请求统计')">查看请求统计</button>
+    <button onclick="toggle('taskPanel',this,'任务中心')">查看任务中心</button>
   </div>
 
   <div class="panel" id="capPanel">
@@ -224,6 +243,42 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
         <button class="sm" style="margin-left:auto" onclick="loadStats()">刷新</button>
       </div>
       <div id="statsBody" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <!-- 任务中心：一键完成官方成长任务。面板只做编排，脚本跑在网关侧（读 auths/） -->
+  <div class="panel" id="taskPanel">
+    <div class="card">
+      <div class="chead">
+        <span class="name">任务中心</span>
+        <span class="tag" id="taskState">…</span>
+        <span class="tag" id="taskCapTag" style="display:none"></span>
+        <button class="sm" style="margin-left:auto" onclick="loadTasks(true)">刷新状态</button>
+      </div>
+
+      <div class="warnbox">
+        <b>一键完成会向腾讯发出真实上报请求</b>（用你账号的凭据，走网关侧脚本）。
+        「扫描待办」全程只读，先扫描再决定跑什么最稳妥。
+        官方 18 个成长任务里 17 个可纯 API 完成，剩下 1 个需真实捐款、脚本会自动跳过。
+        全量跑一个账号约 1–4 分钟（含真实对话任务），不会立刻结束。
+      </div>
+
+      <div class="bar" style="margin:14px 0 0">
+        <button class="primary" id="btnTaskScan" onclick="taskRun('scan')">扫描待办</button>
+        <button id="btnTaskAll" onclick="taskRun('run')">一键完成全部</button>
+        <button id="btnTaskClaim" onclick="taskRun('run',{only_claim:true})">只领奖</button>
+        <button id="btnTaskSchool" onclick="taskSchool('list')">开学季盘点</button>
+        <button class="sm" id="btnTaskCancel" style="display:none" onclick="taskCancel()">取消</button>
+      </div>
+
+      <div id="taskBody" class="tgrid"></div>
+
+      <details id="taskLogWrap" style="margin-top:14px;display:none">
+        <summary style="cursor:pointer;color:var(--muted);font-size:12.5px">
+          原始日志 <span id="taskLogCount"></span>
+        </summary>
+        <div class="tlog" id="taskLog"></div>
+      </details>
     </div>
   </div>
 
@@ -355,9 +410,10 @@ function updateSubline() {
 
 function toggle(id, btn, name) {
   const el = $(id), on = el.classList.toggle('on');
-  btn.textContent = (on ? '收起' : '查看') + name;
+  if (btn) btn.textContent = (on ? '收起' : '查看') + name;
   if (on && id === 'modelPanel' && !$('modelBody').dataset.loaded) loadModels();
   if (on && id === 'statsPanel') loadStats();
+  if (on && id === 'taskPanel') loadTasks();
 }
 
 // ── 网关切换 ──────────────────────────────────────────────────────────
@@ -492,6 +548,7 @@ async function loadEndpoint() {
   if (!caps.login) { $('btnAddCn').disabled = true; $('btnAddGlobal').disabled = true; missing.push('新增账号'); }
   if (!caps.checkin) $('btnCheckin').disabled = true;
   if (!caps.trial) $('btnTrial').disabled = true;
+  applyTaskCaps(e);      // 任务中心的能力标记也跟着这次 endpoint 读取走
   if (missing.length) {
     const extra = [];
     if (!caps.bin_dir) extra.push('未检测到网关程序目录（--bin-dir）');
@@ -884,6 +941,238 @@ async function clineAdd() {
       toast('登录失败：' + (s.error || ''), 6000);
     }
   }, 3000);
+}
+
+// ── 任务中心（一键完成成长任务）───────────────────────────────────────
+// 面板只做编排：脚本在网关侧跑（读 auths/），面板解析它的日志渲染进度。
+// 状态名与后端 panel.py 的 classify_line() 一一对应 —— 那边改了这里要跟着改。
+const TASK_ST = {
+  done:    ['✅', '已完成', 'ok'],
+  already: ['✓',  '已领',   'ok'],
+  running: ['◐',  '进行中', 'warn'],
+  planned: ['◇',  '待执行', ''],
+  pending: ['○',  '待下次', 'warn'],
+  skip:    ['—',  '跳过',   ''],
+  error:   ['✗',  '失败',   'err'],
+};
+let TASK_TIMER = null, TASK_SEQ = 0, TASK_OPEN = false;
+
+async function loadTasks(loud) {
+  const st = await api('/tasks/status');
+  if (!EP) loadEndpoint();          // 能力标记由 loadEndpoint → applyTaskCaps 统一设置
+  if (!st || st.error) {
+    $('taskState').textContent = '不可用';
+    $('taskBody').innerHTML = `<div class="meta">读取失败：${esc((st && st.error) || '')}</div>`;
+    return;
+  }
+  renderTasks(st);
+  if (st.running) startTaskPoll(); else stopTaskPoll();
+  if (loud) toast(st.running ? '作业进行中' : '状态已刷新', 1600);
+}
+
+function applyTaskCaps(ep) {
+  const caps = ep.capabilities || {}, t = ep.tasks || {};
+  const on = !!caps.tasks;
+  ['btnTaskScan', 'btnTaskAll', 'btnTaskClaim', 'btnTaskSchool'].forEach(id => {
+    if ($(id)) { $(id).disabled = !on; $(id).dataset.capoff = on ? '' : '1'; }
+  });
+  if (!on) {
+    // 与「新增账号」同构的降级说明：不可用时说清原因与替代路径，而不是点了才报错
+    const miss = [];
+    if (!t.task_runner) miss.push('任务脚本 scripts/task_runner.py');
+    if (!t.auth_dir) miss.push('凭据目录（--auth-dir）');
+    $('taskCapTag').style.display = '';
+    $('taskCapTag').textContent = '未启用';
+    $('taskBody').innerHTML = `<div class="infobox">
+      <b>一键任务未启用</b>：需要面板与网关<b>同机部署</b>（要能调到网关的
+      <code>scripts/</code> 与 <code>auths/</code>）。<br>
+      当前缺少：${esc(miss.join('、') || '任务脚本目录')}。
+      在网关侧直接用 <code>python3 scripts/task_runner.py ALL --yes</code> 效果相同。
+      </div>`;
+  } else {
+    $('taskCapTag').style.display = '';
+    $('taskCapTag').textContent = t.has_school ? '成长 + 开学季' : '仅成长任务';
+  }
+}
+
+function renderTasks(st) {
+  const items = st.items || [], sum = st.summary || {}, counts = st.counts || {};
+  const LABEL = {idle: '未运行', pending: '启动中', running: '运行中',
+                 done: '已完成', failed: '有失败项', cancelled: '已取消'};
+  $('taskState').textContent = LABEL[st.state] || st.state || '—';
+  $('btnTaskCancel').style.display = st.running ? '' : 'none';
+  ['btnTaskScan', 'btnTaskAll', 'btnTaskClaim', 'btnTaskSchool'].forEach(id => {
+    if ($(id)) $(id).disabled = !!st.running || $(id).dataset.capoff === '1';
+  });
+
+  const logWrap = $('taskLogWrap');
+  if (items.length || st.log_lines) logWrap.style.display = '';
+  $('taskLogCount').textContent = st.log_lines ? `（${st.log_lines} 行）` : '';
+
+  if (!items.length && !st.log_lines && st.state === 'idle') {
+    $('taskBody').innerHTML = '';
+    return;
+  }
+
+  // 顶部：进度 + 汇总数字。
+  // 数字优先采信脚本自己的汇总行（它是权威口径：total 含所有被处理的任务，
+  // 而 item 表只有脚本真的打印了日志的那些）；脚本还没输出汇总行时回落到 item 统计。
+  const tasks = items.filter(i => i.code);      // 排除账号级事件行
+  const num = (fromSummary, fromItems) =>
+    (sum[fromSummary] != null) ? sum[fromSummary] : (fromItems || 0);
+  const nTotal = num('total', tasks.length);
+  const nDone = num('ok', counts.done);
+  const nAlready = num('already', counts.already);
+  const nPending = num('pending', counts.pending);
+  const nFail = num('fail', counts.error);
+  const settled = nDone + nAlready + nPending + nFail;
+  const pct = nTotal ? Math.min(100, Math.round(settled / nTotal * 100)) : 0;
+  const credit = sum.credit != null ? sum.credit
+    : items.reduce((a, i) => a + (i.credit || 0), 0);
+  const energy = sum.energy != null ? sum.energy
+    : items.reduce((a, i) => a + (i.energy || 0), 0);
+  const stat = (k, v, color) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v"${color ? ` style="color:${color}"` : ''}>${v}</div></div>`;
+
+  let head = '';
+  if (st.running || nTotal) {
+    const el = st.elapsed_sec ? `${Math.floor(st.elapsed_sec / 60)} 分 ${Math.round(st.elapsed_sec % 60)} 秒` : '';
+    head += `<div class="meta" style="margin:12px 0 0">
+      ${esc(st.label || '')}${el ? ' · ' + el : ''}${st.write ? ' · <b>含写操作</b>' : ' · 只读'}
+      ${st.running ? '' : ` · 退出码 ${st.exit_code ?? '—'}`}
+      ${st.error ? `<br><span style="color:var(--err)">${esc(st.error)}</span>` : ''}</div>`;
+    if (nTotal) head += `<div class="tprog"><i style="width:${pct}%"></i></div>`;
+    head += `<div class="summary" style="margin-bottom:6px">
+      ${stat('任务项', nTotal)}
+      ${stat('已完成', nDone, nDone ? 'var(--ok)' : '')}
+      ${stat('已领', nAlready)}
+      ${stat('待下次', nPending, nPending ? 'var(--warn)' : '')}
+      ${stat('失败', nFail, nFail ? 'var(--err)' : '')}
+      ${stat('入账', `+${credit} 积分 / +${energy} 能量`)}
+    </div>`;
+  }
+  if (st.state === 'cancelled') {
+    head += `<div class="warnbox">作业已取消。已点亮但未领奖的任务可以点「只领奖」补
+      —— 领奖端点幂等，重跑安全。</div>`;
+  }
+
+  // 按账号分组：先按 uid 稳定排序，组内保持脚本给出的（依赖）顺序
+  const groups = new Map();
+  items.forEach((it, idx) => {
+    if (!groups.has(it.uid)) groups.set(it.uid, []);
+    groups.get(it.uid).push({...it, _idx: idx});
+  });
+
+  const body = [...groups.entries()].map(([uid, list]) => {
+    const nick = list[0].nickname || '';
+    const done = list.filter(i => ['done', 'already'].includes(i.status)).length;
+    const rows = list.map(it => {
+      const isAccountLevel = !it.code;
+      const [icon, label, cls] = isAccountLevel
+        ? ['·', '账号', '']
+        : (TASK_ST[it.status] || ['·', it.status || '未知', '']);
+      const prog = /\((\d+)\/(\d+)\)/.exec(it.message || '');
+      const reward = it.credit || it.energy
+        ? `+${it.credit} 积分${it.energy ? ` / +${it.energy} 能量` : ''}` : '';
+      // 已知状态给中文标签；未知状态不猜语义，把脚本原文留在说明列
+      const known = isAccountLevel || !!TASK_ST[it.status];
+      return `<tr>
+        <td>${icon}</td>
+        <td class="code">${esc(it.code || '（账号级）')}</td>
+        <td class="st"><span class="tag ${cls}">${known ? esc(label) : '—'}</span></td>
+        <td class="prog">${prog ? `${prog[1]}/${prog[2]}` : ''}</td>
+        <td style="color:var(--muted)">${esc(reward)}</td>
+        <td style="color:var(--muted)">${esc((it.message || '').slice(0, 90))}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="tacct">
+      <div class="tacct-h"><span>${esc(nick || uid)}</span>
+        <span class="tag">${done}/${list.length}</span>
+        ${nick ? `<span class="meta" style="margin:0">${esc(uid)}</span>` : ''}</div>
+      <table class="tst"><thead><tr><th></th><th>任务</th><th>状态</th>
+        <th style="text-align:right">进度</th><th>奖励</th><th>说明</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+  }).join('');
+
+  $('taskBody').innerHTML = head + body;
+}
+
+function startTaskPoll() {
+  if (TASK_TIMER) return;
+  TASK_TIMER = setInterval(async () => {
+    const st = await api('/tasks/status?since=' + TASK_SEQ);
+    if (!st || st.error) return;
+    if (st.lines) appendTaskLog(st.lines);
+    TASK_SEQ = st.log_lines || TASK_SEQ;
+    renderTasks(st);
+    if (!st.running) {
+      stopTaskPoll();
+      await loadAll();          // 任务可能改了积分，刷新账号卡片
+      toast('任务作业结束：' + (st.label || ''), 4000);
+    }
+  }, 2000);
+}
+
+function stopTaskPoll() { clearInterval(TASK_TIMER); TASK_TIMER = null; }
+
+function appendTaskLog(lines) {
+  const el = $('taskLog');
+  if (!lines.length) return;
+  // 只在靠近底部时自动滚动：用户翻看历史时不打断
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.textContent += lines.map(l => l.text).join('\n') + '\n';
+  if (el.textContent.length > 200000) el.textContent = el.textContent.slice(-150000);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+let TASK_JOB = '';
+async function taskRun(kind, opts) {
+  const o = opts || {};
+  if (kind === 'run') {
+    const what = o.only_claim
+      ? '把所有「已完成但未领奖」的任务领掉？\n\n领奖端点幂等，重复领不会出错。'
+      : '一键完成全部账号的成长任务？\n\n' +
+        '这会用账号凭据向腾讯发出真实上报请求（含真实对话任务），' +
+        '全量约需数分钟到十几分钟。\n建议先「扫描待办」看看有多少待办。';
+    if (!confirm(what)) return;
+  }
+  const body = Object.assign({}, o);
+  const r = await api('/tasks/' + kind, {method: 'POST', body: JSON.stringify(body)});
+  if (!r || r.error) { toast('启动失败：' + ((r && r.error) || '未知'), 8000); return; }
+  TASK_JOB = r.job || '';
+  TASK_SEQ = 0;
+  $('taskLog').textContent = '';
+  if (r.argv) $('taskLog').textContent = '$ ' + r.argv.join(' ') + '\n';
+  toast((r.label || '任务') + ' 已启动', 3000);
+  if (!$('taskPanel').classList.contains('on')) toggle('taskPanel', null, '任务中心');
+  await loadTasks();
+  startTaskPoll();
+}
+
+async function taskSchool(mode) {
+  if (mode === 'list') {
+    const r = await api('/tasks/school', {method: 'POST', body: JSON.stringify({mode: 'list'})});
+    if (!r || r.error) { toast('启动失败：' + ((r && r.error) || ''), 7000); return; }
+    TASK_SEQ = 0; $('taskLog').textContent = '';
+    toast('开学季盘点已启动（只读）', 3000);
+    if (!$('taskPanel').classList.contains('on')) toggle('taskPanel', null, '任务中心');
+    await loadTasks(); startTaskPoll();
+    return;
+  }
+  const label = mode === 'run' ? '执行开学季任务并领奖' : '清空开学季抽奖次数';
+  if (!confirm(label + '？\n\n会向腾讯发出真实上报/抽奖请求。')) return;
+  const r = await api('/tasks/school', {method: 'POST', body: JSON.stringify({mode})});
+  if (!r || r.error) { toast('启动失败：' + ((r && r.error) || ''), 7000); return; }
+  TASK_SEQ = 0; $('taskLog').textContent = '';
+  toast(label + ' 已启动', 3000);
+  await loadTasks(); startTaskPoll();
+}
+
+async function taskCancel() {
+  if (!confirm('取消当前任务作业？\n\n已点亮但未领奖的任务可稍后用「只领奖」补（幂等）。')) return;
+  const r = await api('/tasks/cancel', {method: 'POST', body: '{}'});
+  toast(r.ok ? '已取消' : ('取消失败：' + (r.error || '')), 4000);
+  await loadTasks();
 }
 
 // 首屏加载当前页（wb2a）+ 轻量拉一次 cline 摘要，只为把标签徽标点亮 ——

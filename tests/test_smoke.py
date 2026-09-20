@@ -8,8 +8,10 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.request
@@ -55,6 +57,29 @@ def _wait_http(url, timeout=15):
     return False
 
 
+def _stop(*procs):
+    """终止子进程并关闭其 stdout 管道。
+
+    不关管道会在解释器退出时刷一串 ResourceWarning（unclosed file）—— 测试
+    仍然全绿，但输出被噪声盖住，真正的失败反而不好找。
+    """
+    for p in procs:
+        if not p:
+            continue
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=5)
+        if p.stdout:
+            try:
+                p.stdout.close()
+            except OSError:
+                pass
+
+
 class TestSmoke(unittest.TestCase):
     """起 stub 网关 + 面板，验证真实 HTTP 通路。"""
 
@@ -76,7 +101,11 @@ class TestSmoke(unittest.TestCase):
         cls.panel = subprocess.Popen(
             [sys.executable, str(ROOT / "panel.py"),
              "--base", "http://127.0.0.1:%d" % GW_PORT,
-             "--key", "testkey", "--port", str(PANEL_PORT)],
+             "--key", "testkey", "--port", str(PANEL_PORT),
+             # 显式指向不存在的网关配置：否则面板会在 cwd 上溯时发现本机真实的
+             # wb2a/app（带 linux 二进制与 config.json），能力探测结果随开发机而变 ——
+             # 本组测试断言的是「没有 CLI 工具时的降级形态」，必须封闭这个变量。
+             "--gateway-config", "/nonexistent/gateway/config.json"],
             cwd=str(ROOT), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if not _wait_http("http://127.0.0.1:%d/" % PANEL_PORT):
@@ -86,13 +115,7 @@ class TestSmoke(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for p in (cls.panel, cls.gw):
-            if p and p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+        _stop(cls.panel, cls.gw)
 
     # — 测试 ——————————————————————————————————————————————
 
@@ -269,13 +292,7 @@ class TestClineSmoke(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for p in (cls.panel, cls.plain, cls.cline, cls.gw):
-            if p and p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+        _stop(cls.panel, cls.plain, cls.cline, cls.gw)
 
     def _api(self, path):
         return _get("http://127.0.0.1:%d%s" % (CLINE_PANEL_PORT, path))
@@ -442,6 +459,217 @@ class TestClineSmoke(unittest.TestCase):
         self.assertEqual(models["glm-5.3-flash"]["last_cost"], 0)
         self.assertEqual(models["claude-opus-5"]["last_cost"], 65)
         self.assertIn("credits", models["claude-opus-5"]["disable_reason"])
+
+
+TASK_GW_PORT = 7904        # 任务中心冒烟自带 stub 网关 + 假脚本目录
+TASK_PANEL_PORT = 8404
+
+
+class TestTaskSmoke(unittest.TestCase):
+    """任务中心的 HTTP 通路：起一个带假脚本的「网关目录」，走一遍启动→轮询→结束。
+
+    单独起一套进程，因为这一组需要 --bin-dir / --auth-dir 指向一个**可写**的假
+    网关目录（脚本要能被拉起、argv 要能被记录），而 TestSmoke 那组刻意是「无工具」
+    的降级形态，两者的面板配置互斥。
+    """
+
+    gw: subprocess.Popen = None
+    panel: subprocess.Popen = None
+    app: Path = None
+
+    @classmethod
+    def setUpClass(cls):
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["STUB_TASK_DELAY"] = "0.05"
+        cls.app = Path(tempfile.mkdtemp(prefix="wb2a-task-"))
+        (cls.app / "scripts").mkdir()
+        (cls.app / "auths").mkdir()
+        for name in ("task_runner.py", "school_open_day_2026.py"):
+            shutil.copy(ROOT / "tests" / "stub_tasks.py", cls.app / "scripts" / name)
+
+        cls.gw = subprocess.Popen(
+            [sys.executable, str(ROOT / "tests" / "stub_gateway.py"), "--port", str(TASK_GW_PORT)],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait_http("http://127.0.0.1:%d/status" % TASK_GW_PORT):
+            cls.gw.terminate()
+            raise unittest.SkipTest("stub 网关未能启动")
+
+        cls.panel = subprocess.Popen(
+            [sys.executable, str(ROOT / "panel.py"),
+             "--base", "http://127.0.0.1:%d" % TASK_GW_PORT,
+             "--key", "testkey", "--port", str(TASK_PANEL_PORT),
+             "--bin-dir", str(cls.app), "--auth-dir", str(cls.app / "auths")],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if not _wait_http("http://127.0.0.1:%d/" % TASK_PANEL_PORT):
+            cls.panel.terminate()
+            cls.gw.terminate()
+            raise unittest.SkipTest("面板未能启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        _stop(cls.panel, cls.gw)
+        if cls.app:
+            shutil.rmtree(cls.app, ignore_errors=True)
+
+    def _api(self, path):
+        return _get("http://127.0.0.1:%d%s" % (TASK_PANEL_PORT, path))
+
+    def _post(self, path, payload):
+        return _post("http://127.0.0.1:%d%s" % (TASK_PANEL_PORT, path), payload)
+
+    def _run_and_wait(self, path, payload, timeout=40):
+        """启动一个作业并轮询到结束，返回最终状态。"""
+        status, body = self._post(path, payload)
+        self.assertEqual(status, 200, body)
+        d = json.loads(body)
+        self.assertTrue(d.get("ok"), d)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, st = self._api("/api/tasks/status")
+            s = json.loads(st)
+            if not s.get("running"):
+                return d, s
+            time.sleep(0.2)
+        self.fail("作业未在 %ss 内结束" % timeout)
+
+    def test_capability_reports_enabled(self):
+        """配了 bin_dir/auth_dir + 脚本在位 → 任务中心可用。"""
+        _, body = self._api("/api/endpoint")
+        caps = json.loads(body)["capabilities"]
+        self.assertTrue(caps["tasks"])
+        self.assertTrue(caps["auth_dir"])
+        _, tb = self._api("/api/endpoint")
+        t = json.loads(tb)["tasks"]
+        self.assertTrue(t["enabled"])
+        self.assertTrue(t["has_school"])
+        self.assertTrue(t["task_runner"].endswith("task_runner.py"))
+
+    def test_status_contract_shape(self):
+        """/api/tasks/status 的字段契约。
+
+        不断言 idle：本组共用一个面板进程，unittest 按字母序跑，此时可能已有作业
+        跑过。「没有任何作业时是 idle」在 test_tasks.py 的单测里确定性覆盖。
+        """
+        _, body = self._api("/api/tasks/status")
+        d = json.loads(body)
+        for key in ("job", "state", "running", "items", "summary", "accounts", "counts"):
+            self.assertIn(key, d, key)
+        self.assertIsInstance(d["items"], list)
+        self.assertIn(d["state"], ("idle", "pending", "running", "done", "failed", "cancelled"))
+
+    def test_scan_is_read_only(self):
+        """扫描是只读的：命令里不能出现 --yes —— 这是防误发上报的关键闸门。"""
+        started, st = self._run_and_wait("/api/tasks/scan", {})
+        self.assertNotIn("--yes", started["argv"])
+        self.assertFalse(started["write"])
+        self.assertEqual(st["state"], "done")
+        codes = {i["code"]: i["status"] for i in st["items"]}
+        self.assertEqual(codes.get("create_canvas"), "planned")
+        self.assertEqual(codes.get("Expert_Philanthropy"), "skip")
+
+    def test_run_collects_progress_and_rewards(self):
+        started, st = self._run_and_wait("/api/tasks/run", {})
+        self.assertIn("--yes", started["argv"])
+        self.assertTrue(started["write"])
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(st["summary"]["credit"], 750)
+        by_code = {i["code"]: i for i in st["items"]}
+        self.assertEqual(by_code["chat_5"]["credit"], 300)
+        self.assertEqual(st["accounts"].get("00e26541"), "测试账号甲")
+
+    def test_only_claim_flag_forwarded(self):
+        started, _ = self._run_and_wait("/api/tasks/run", {"only_claim": True})
+        self.assertIn("--only-claim", started["argv"])
+        self.assertIn("--yes", started["argv"])
+
+    def test_accounts_forwarded_as_filenames(self):
+        """账号要转成完整 auths 文件名 —— uid 前缀会撞号。"""
+        started, _ = self._run_and_wait("/api/tasks/scan", {"accounts": ["abc123"]})
+        self.assertIn("workbuddy-abc123.json", started["argv"])
+
+    def test_school_list_mode(self):
+        started, st = self._run_and_wait("/api/tasks/school", {"mode": "list"})
+        self.assertIn("--list", started["argv"])
+        self.assertNotIn("--yes", started["argv"])
+        self.assertFalse(started["write"])
+        self.assertIn("share_invite", [i["code"] for i in st["items"]])
+
+    def test_school_invalid_mode_rejected(self):
+        status, body = self._post("/api/tasks/school", {"mode": "boom"})
+        self.assertEqual(status, 400)
+        self.assertIn("list", json.loads(body)["error"])
+
+    def test_incremental_log_endpoint(self):
+        _, st = self._run_and_wait("/api/tasks/scan", {})
+        total = st["log_lines"]
+        self.assertGreater(total, 5)
+        _, body = self._api("/api/tasks/status?since=0")
+        self.assertEqual(len(json.loads(body)["lines"]), total)
+        _, body = self._api("/api/tasks/status?since=%d" % total)
+        self.assertEqual(json.loads(body)["lines"], [])
+
+    def test_cancel_without_job_is_409(self):
+        status, body = self._post("/api/tasks/cancel", {})
+        self.assertEqual(status, 409)
+        self.assertIn("error", json.loads(body))
+
+    def test_task_post_requires_csrf_header(self):
+        """任务端点是状态变更接口，同样要过 CSRF 闸门。"""
+        status, _ = _post("http://127.0.0.1:%d/api/tasks/scan" % TASK_PANEL_PORT,
+                          {}, csrf=False)
+        self.assertEqual(status, 403)
+
+    def test_task_center_markup_present(self):
+        """页面要有任务中心的容器、按钮与状态映射 —— 否则后端能力再多也点不到。"""
+        _, html = self._get_index()
+        for marker in ('id="taskPanel"', 'id="btnTaskScan"', 'id="btnTaskAll"',
+                       'id="btnTaskClaim"', 'id="btnTaskCancel"', 'id="taskBody"',
+                       'id="taskLog"'):
+            self.assertIn(marker, html)
+        # 状态映射表要与后端 classify_line() 的口径对齐
+        for st in ("done", "already", "running", "planned", "pending", "skip", "error"):
+            self.assertIn(st + ":", html, st)
+
+    def test_capability_marking_is_wired_into_endpoint_load(self):
+        """能力标记必须在 loadEndpoint 里设置。
+
+        曾经只在 loadTasks 首轮拿一次 endpoint，之后永不重设 —— 于是「未启用」标签
+        永远不出现、按钮的禁用态也可能被 renderTasks 覆盖回去。
+        """
+        _, html = self._get_index()
+        self.assertIn("function applyTaskCaps(", html)
+        # loadEndpoint 必须调用它（与 login/checkin/trial 的禁用同处）
+        idx = html.index("async function loadEndpoint(")
+        end = html.index("\nasync function", idx + 10)
+        self.assertIn("applyTaskCaps(", html[idx:end])
+
+    def test_summary_numbers_prefer_script_totals(self):
+        """顶部数字优先采信脚本汇总行 —— item 表只有打印过日志的任务，会偏小。"""
+        _, html = self._get_index()
+        self.assertIn("sum[fromSummary]", html)
+
+    def test_render_tasks_does_not_reference_undefined_vars(self):
+        """renderTasks 里不得引用未定义变量。
+
+        实测踩过：把 total 改名成 nTotal 时漏改一处引用，renderTasks 抛
+        ReferenceError 被 fetch 的 catch 吞掉，表现为「状态显示已完成但表格空白」——
+        比报错更难查。这里用 node 语法检查 + 关键标识符断言兜住。
+        """
+        _, html = self._get_index()
+        idx = html.index("function renderTasks(")
+        end = html.index("\nfunction ", idx + 10)
+        body = html[idx:end]
+        for name in ("nTotal", "nDone", "nAlready", "nPending", "nFail"):
+            self.assertIn(name, body, name)
+        # 旧名不得残留（它就是漏改的那处）
+        self.assertNotIn("|| total", body)
+        self.assertNotIn("? total", body)
+
+    def _get_index(self):
+        return _get("http://127.0.0.1:%d/" % TASK_PANEL_PORT)
 
 
 if __name__ == "__main__":

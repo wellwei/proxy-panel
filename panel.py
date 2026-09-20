@@ -19,9 +19,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -34,13 +36,15 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
 DEFAULT_HOST = "127.0.0.1"     # 默认只监听回环：面板持有网关 api_key
 LOGIN_TIMEOUT = 300          # 登录会话有效期（秒）
 CLI_TIMEOUT = 150            # 运维 CLI 超时
+TASK_LOG_CAP = 2000          # 任务作业日志环形缓冲行数上限
+TASK_ITEMS_CAP = 400         # 任务项表格上限（超出只截断展示，不影响执行）
 
 # 不走任何 HTTP 代理：面板只访问本机网关与本机网络。
 # 宿主机常有 http_proxy（如 127.0.0.1:7890），不加这行会把回环请求也代理出去。
@@ -54,7 +58,7 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 class Config:
     def __init__(self, gateway: str, api_key: str, auth_dir: str, bin_dir: str,
                  port: int, gateway_config: str = "", host: str = "127.0.0.1",
-                 cline: dict | None = None):
+                 cline: dict | None = None, script_dir: str = ""):
         self.gateway = gateway.rstrip("/")
         self.api_key = api_key
         self.auth_dir = Path(auth_dir).expanduser() if auth_dir else None
@@ -65,6 +69,8 @@ class Config:
         # 第二网关（cline2api）: {"base", "api_key", "admin_token", "config_path"}。
         # None 时面板行为与单网关版完全一致（老部署零改动）。
         self.cline = cline or None
+        # 任务脚本目录（网关 app/scripts/）。显式覆盖优先，否则从 bin_dir 推导。
+        self.script_dir = Path(script_dir).expanduser() if script_dir else None
 
     @property
     def exposed(self) -> bool:
@@ -95,6 +101,57 @@ class Config:
     @property
     def can_trial(self) -> bool:
         return self.tool("trial_bin") is not None
+
+    # — 任务脚本（一键完成成长任务）—————————————————————————
+    @property
+    def resolved_script_dir(self):
+        """任务脚本目录。显式指定优先；否则从 bin_dir / gateway_config 推导。
+
+        做成属性而不是在构造时算死：显式构造 Config 的调用方（测试、嵌入式用法）
+        不必自己推导；同时也让「先设 bin_dir 再问脚本」这种顺序更自然。
+        """
+        if self.script_dir:
+            return self.script_dir
+        for base in (self.bin_dir, Path(self.gateway_config).parent if self.gateway_config else None):
+            if not base:
+                continue
+            for cand in (Path(base) / "scripts", Path(base)):
+                if (cand / "task_runner.py").is_file():
+                    return cand
+        return None
+
+    def task_script(self, name: str):
+        """返回网关 scripts/ 下某个任务脚本的路径（不存在则 None）。
+
+        脚本是 .py（不是加执行位的二进制），所以不能用 tool() 那套「有执行位」
+        判定；找到文件即可，解释器由 python_exe 提供。
+        """
+        d = self.resolved_script_dir
+        if not d:
+            return None
+        p = Path(d) / name
+        return p if p.is_file() else None
+
+    @property
+    def python_exe(self):
+        """跑任务脚本的解释器路径（不存在则 None）。
+
+        sys.executable 优先（面板自己在 python3 里跑，用它最稳）；某些打包/嵌入
+        场景下它是空串，再退回 PATH 上的 python3。
+        """
+        if sys.executable and Path(sys.executable).is_file():
+            return sys.executable
+        return shutil.which("python3") or None
+
+    @property
+    def can_tasks(self) -> bool:
+        """一键任务需要：脚本在位 + 能读凭据 + 有解释器。
+
+        三者缺一都会让子进程直接失败，所以前置判定，避免点了才报错。
+        """
+        return (self.task_script("task_runner.py") is not None
+                and self.auth_dir is not None
+                and self.python_exe is not None)
 
 
 def normalize_listen(listen: str) -> str:
@@ -209,9 +266,13 @@ def load_config(args) -> Config:
     port = args.port or int(os.environ.get("WB2A_PANEL_PORT") or panel_cfg.get("port") or DEFAULT_PORT)
     host = pick(args.host, "WB2A_PANEL_HOST", "host", DEFAULT_HOST)
 
+    # 任务脚本目录：显式指定优先（--script-dir / WB2A_SCRIPT_DIR），
+    # 否则由 Config.resolved_script_dir 从 bin_dir / gateway_config 推导。
+    script_dir = pick(getattr(args, "script_dir", ""), "WB2A_SCRIPT_DIR", "script_dir", "")
+
     cline = load_cline_config(args, panel_cfg)
 
-    return Config(base, api_key, auth_dir, bin_dir, port, gw_cfg_path, host, cline)
+    return Config(base, api_key, auth_dir, bin_dir, port, gw_cfg_path, host, cline, script_dir)
 
 
 def load_cline_config(args, panel_cfg: dict) -> dict | None:
@@ -312,6 +373,430 @@ def extract_error_message(res) -> str:
     return str(res)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 任务脚本输出解析
+# ──────────────────────────────────────────────────────────────────────
+#
+# 脚本没有结构化输出，界面进度只能从日志行解析。所以这个解析器是「尽力而为」的：
+# 认不出的行一律降级成原始日志，绝不猜状态 —— 界面宁可少显示，也不能显示错的进度。
+# 脚本随上游（Sliverkiss）演进会改文案，识别失败时 degrade 而不是报错。
+
+# 账号表头：== 00e26541（昵称 A） ==
+_ACC_HEAD = re.compile(r"^==\s*([0-9a-zA-Z_-]+)\s*(?:[（(](.*?)[）)])?\s*==\s*$")
+# 任务项：[task_runner] 00e26541 chat_5: report 1/5 200 code=0
+# 也覆盖 [school2026] 前缀，与无 code 的账号级事件（query/lottery/draw）。
+_TASK_LINE = re.compile(
+    r"^\[(?:task_runner|school2026)\]\s+([0-9a-zA-Z_-]+)\s+(.+)$")
+# 汇总行：task_runner done: accounts=3 total=57 ok=20 ... credit=+1200 energy=+40
+_SUMMARY = re.compile(r"^(?:task_runner|school2026)\s+done:\s*(.*)$")
+# 账号级 skip / 错误
+_SKIP_GLOBAL = re.compile(r"^\[skip\]\s+([0-9a-zA-Z_-]+)\s")
+_CODE_TOKEN = re.compile(r"^([A-Za-z][A-Za-z0-9_.]*)\s*:\s*(.*)$")
+_REWARD = re.compile(r"(credit|energy)=([+-]?\d+)")
+# 任务码里含「:」的形态（如 Expert_team_use_3）不会出现；但 "query 任务不存在" 这类
+# 无 code 的账号级事件必须能落回账号而不是被当成任务。
+
+# 状态判定：按「先具体后笼统」顺序匹配，命中即停。顺序即优先级。
+_STATUS_RULES = [
+    # 失败
+    ("error", ("-> ERR", "claim 失败", "report 失败", "处理失败", "拉取失败",
+               "激活失败", "list_tasks 失败", "报告失败", "query 失败")),
+    # 已完成（本轮入账）
+    ("done", ("claim 200 ok(", "claim 200 ok", "-> claimed（本轮已入账）",
+              "（点亮）", "-> claimed", "buddy/first -> 200")),
+    # 已领 / 已完成（无需动作）
+    ("already", ("已领，跳过", "已完成/已领", "already_claimed", "无需上报", "无需抽奖",
+                 "余额=0", "balance=0")),
+    # 待下次（有进展但未达目标：服务端异步归账、时段未到、登记未生效）
+    ("pending", ("未达 target", "WARN 待下次", "skip pending", "未登记生效",
+                 "only_claim 跳过", "可稍后补领", "部分点亮", "未变化")),
+    # 跳过（不可伪造 / 未映射 / 不存在）
+    ("skip", ("不可伪造", "任务不存在", "非映射任务", "未映射(人工/未知)", "人工环节",
+              "不存在，skip", "skip")),
+    # 扫描态（dry-run：只报告将做什么）
+    ("planned", ("dry-run 跳过", "dry-run 不写", "dry-run：将", "dry-run")),
+    # 进行中（上报/激活过程中）
+    ("running", ("report ", "viewed 激活", "accept 尝试", "前置解锁", "share-complete")),
+]
+
+
+def classify_line(text: str) -> str:
+    """把一条任务描述判成状态。命中第一条规则即返回；都不中返回空串（未知）。
+
+    未知返回空串而不是 "unknown"：调用方据此把整行原样留在日志里，不生成假的
+    进度条目 —— 脚本改了文案时，界面显示的是「日志里有这行」而不是「这行是错误」。
+    """
+    for status, markers in _STATUS_RULES:
+        for m in markers:
+            if m in text:
+                return status
+    return ""
+
+
+def parse_rewards(text: str) -> tuple[int, int]:
+    """从一行里提 (credit, energy) 增量。脚本的形态是 credit=+1200 energy=+40。"""
+    credit = energy = 0
+    for kind, val in _REWARD.findall(text):
+        try:
+            n = int(val)
+        except ValueError:
+            continue
+        if kind == "credit":
+            credit += n
+        else:
+            energy += n
+    return credit, energy
+
+
+def parse_summary(text: str) -> dict:
+    """解析汇总行的 k=v 序列。认不出的 key 原样带上，界面按需取用。"""
+    out = {}
+    for k, v in re.findall(r"([a-z_]+)=([+-]?\d+)", text):
+        try:
+            out[k] = int(v)
+        except ValueError:
+            continue
+    return out
+
+
+class TaskProgress:
+    """一个任务作业的进度累积器。
+
+    与 HTTP 层分离、与 subprocess 也分离：喂给它一行文本即可，便于单测。
+    线程安全：只有作业线程写、HTTP 线程读，用锁保护。
+    """
+
+    def __init__(self, log_cap: int = TASK_LOG_CAP, items_cap: int = TASK_ITEMS_CAP):
+        self._lock = threading.Lock()
+        self._log = []               # [(seq, text)]
+        self._seq = 0
+        self._items = {}             # (uid8, code) -> item dict
+        self._order = []             # item key 的稳定顺序
+        self._accounts = {}          # uid8 -> 昵称
+        self.summary = {}            # 汇总行解析结果
+        self.error = ""              # 解析/执行层面的错误（非任务失败）
+        self.log_cap = log_cap
+        self.items_cap = items_cap
+
+    # — 写（作业线程）————————————————————————————————————
+    def feed(self, line: str):
+        """喂一行输出。不抛异常：单行解析问题不能中断作业。"""
+        text = (line or "").rstrip("\n\r")
+        with self._lock:
+            self._seq += 1
+            self._log.append((self._seq, text))
+            if len(self._log) > self.log_cap:
+                # 环形：丢最早的一半，保留近端。整段删比逐行删省事且不抖。
+                self._log = self._log[len(self._log) - self.log_cap:]
+        try:
+            self._interpret(text)
+        except Exception as e:                      # 解析永不影响执行
+            with self._lock:
+                if not self.error:
+                    self.error = "解析告警：%s" % e
+
+    def _interpret(self, text: str):
+        m = _SUMMARY.match(text)
+        if m:
+            with self._lock:
+                self.summary.update(parse_summary(m.group(1)))
+            return
+
+        m = _ACC_HEAD.match(text)
+        if m:
+            uid, nick = m.group(1), (m.group(2) or "").strip()
+            with self._lock:
+                if nick:
+                    self._accounts[uid] = nick
+            return
+
+        m = _SKIP_GLOBAL.match(text)
+        if m:
+            self._add_item(m.group(1), "", text, "skip", nick_hint=True)
+            return
+
+        if text.startswith("ERR:"):
+            # 账号级错误（如 list_tasks 失败）：挂到 uid（若有）而不是丢进虚无
+            uid = ""
+            inner = re.search(r"\[(?:task_runner|school2026)\]\s+([0-9a-zA-Z_-]+)", text)
+            if inner:
+                uid = inner.group(1)
+            self._add_item(uid, "", text, "error")
+            return
+
+        m = _TASK_LINE.match(text)
+        if not m:
+            return                                   # 无关行：留在原始日志里
+        uid, rest = m.group(1), m.group(2)
+        status = classify_line(rest)
+        cm = _CODE_TOKEN.match(rest)
+        # 只有「像任务码」的才认成任务：排除 query/lottery/viewed/accept 这类动作词。
+        # 否则 "query energy balance=3" 会被当成名为 query 的任务。
+        code = ""
+        if cm and _looks_like_code(cm.group(1)):
+            code = cm.group(1)
+        self._add_item(uid, code, rest, status or "")
+
+    def _add_item(self, uid, code, text, status, nick_hint=False):
+        if not uid and not code:
+            return
+        key = (uid, code)
+        credit, energy = parse_rewards(text)
+        with self._lock:
+            it = self._items.get(key)
+            if it is None:
+                it = {"uid": uid, "code": code, "status": status or "",
+                      "message": text, "credit": 0, "energy": 0, "events": 0}
+                if len(self._items) >= self.items_cap:
+                    return                            # 超上限：只留日志，不加表
+                self._items[key] = it
+                self._order.append(key)
+            # 后写覆盖先写：同一任务的终态总在最后出现（脚本是先后报后回读再领奖）。
+            # 但 running 不该覆盖已经落定的终态 —— 脚本偶尔会补一行中间态。
+            if status and not (it["status"] in ("done", "already", "error") and status == "running"):
+                it["status"] = status
+            it["message"] = text
+            it["events"] += 1
+            it["credit"] += credit
+            it["energy"] += energy
+
+    # — 读（HTTP 线程）————————————————————————————————————
+    def snapshot(self) -> dict:
+        with self._lock:
+            items = []
+            for key in self._order:
+                it = self._items.get(key)
+                if not it:
+                    continue
+                d = dict(it)
+                d["nickname"] = self._accounts.get(it["uid"], "")
+                items.append(d)
+            return {
+                "items": items,
+                "accounts": dict(self._accounts),
+                "summary": dict(self.summary),
+                "error": self.error,
+                "log_lines": self._seq,
+            }
+
+    def since(self, seq: int):
+        """增量日志：seq 之后的 (seq, text) 列表。轮询用，避免整段重传。"""
+        with self._lock:
+            return [(s, t) for (s, t) in self._log if s > seq]
+
+
+def _looks_like_code(token: str) -> bool:
+    """判断一个 token 是不是任务码，而不是动作词。
+
+    脚本的动作词是 query/report/claim/accept/viewed/draw/lottery 等（小写、无下划线
+    或全小写），任务码则形如 chat_5 / RichMeow_Chat / Expert_team_use_3 /
+    Sequential_Tasks_1 —— 含下划线+数字，或含大写字母。这条判定不追求完备，
+    错了也只是把一个动作词当任务显示，不会影响执行。
+    """
+    if "_" in token or any(c.isupper() for c in token):
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 任务作业（一键完成成长任务）
+# ──────────────────────────────────────────────────────────────────────
+
+class TaskJob:
+    """一次任务脚本执行。生命周期：pending → running → done/failed/cancelled。
+
+    为什么不像 run_tool() 那样同步阻塞：单账号全量含真实对话任务（专家召唤 5 次、
+    每次间隔 6 秒）实测 1–4 分钟，全账号是十几分钟级。HTTP 层挂这么久会被浏览器、
+    反代、systemd 任何一环断开。所以后台线程跑进程、HTTP 只做启动与轮询 ——
+    与登录会话（Panel.session + _login_worker）同一套模式。
+    """
+
+    def __init__(self, kind: str, argv: list, cwd: str, env: dict, label: str,
+                 prog: TaskProgress, lockfile: str = "", on_exit=None):
+        self.id = "%s-%d" % (kind, int(time.time() * 1000))
+        self.kind = kind                # scan | run | school
+        self.label = label
+        self.argv = argv
+        self.cwd = cwd
+        self.env = env
+        self.prog = prog
+        self.lockfile = lockfile
+        self.on_exit = on_exit          # 收尾回调（面板用它释放作业互斥）
+        self.state = "pending"          # pending | running | done | failed | cancelled
+        self.started_at = time.time()
+        self.ended_at = 0.0
+        self.exit_code = None
+        self.write = "--yes" in argv    # 是否含真实写操作（界面据此提示）
+        self._proc = None
+        self._cancelling = False
+        self._lock = threading.Lock()
+
+    # — 状态 —————————————————————————————————————————————
+    @property
+    def elapsed(self) -> float:
+        end = self.ended_at or time.time()
+        return max(0.0, end - self.started_at)
+
+    @property
+    def running(self) -> bool:
+        """是否还没收尾。
+
+        只认「进程真的结束了」才翻 False —— 取消时短暂置中间态会让调用方以为
+        可以启动新作业，而旧进程还在跑（上游副作用还在发）。
+        """
+        with self._lock:
+            return self.state in ("pending", "running")
+
+    def snapshot(self, since=None) -> dict:
+        """作业快照。since 非 None 时附带 seq > since 的增量日志。
+
+        用 None 而不是 0 作默认：前端首次轮询传的就是 0（要拿全量日志），
+        把 0 当假值会让它一行都收不到。
+        """
+        snap = self.prog.snapshot()
+        with self._lock:
+            state, code = self.state, self.exit_code
+        snap.update({
+            "job": self.id, "kind": self.kind, "label": self.label,
+            "state": state, "running": self.running,
+            "write": self.write, "elapsed_sec": round(self.elapsed, 1),
+            "exit_code": code,
+            "pending": snap.get("summary", {}).get("pending", 0),
+            "counts": _count_statuses(snap.get("items") or []),
+        })
+        if since is not None:
+            snap["lines"] = [{"seq": s, "text": t} for (s, t) in self.prog.since(since)]
+        return snap
+
+    # — 执行 —————————————————————————————————————————————
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        """读子进程 stdout 逐行喂给进度累积器，直到进程退出。
+
+        输出按 bytes 读、errors='replace' 解码：与 run_tool() 同口径 —— 脚本输出
+        可能含非 UTF-8 字节，text=True 会直接抛 UnicodeDecodeError。
+
+        收尾顺序是有讲究的：先释放锁与回调，再落终态。这样「running=False」就蕴含
+        「互斥锁已释放」，调用方看到作业结束即可安全启动下一个（不必轮询等锁）。
+        """
+        lock_fd = None
+        outcome, code = "failed", None
+        try:
+            if self.lockfile:
+                lock_fd = _acquire_lock(self.lockfile)
+                if lock_fd is None:
+                    self.prog.feed("ERR: 另一个任务作业正在运行（%s 被占用）" % self.lockfile)
+                    return
+            with self._lock:
+                self.state = "running"
+            self.prog.feed("$ %s" % " ".join(self.argv))
+            self._proc = subprocess.Popen(
+                self.argv, cwd=self.cwd, env=self.env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+            if self._cancelling:                  # 启动前就被取消：立刻收手
+                self._proc.terminate()
+            for raw in iter(self._proc.stdout.readline, b""):
+                self.prog.feed(raw.decode("utf-8", "replace"))
+            self._proc.stdout.close()
+            self._proc.wait()
+            code = self._proc.returncode
+            outcome = "cancelled" if self._cancelling else ("done" if code == 0 else "failed")
+        except FileNotFoundError as e:
+            self.prog.feed("ERR: 无法启动任务脚本：%s" % e)
+        except Exception as e:
+            self.prog.feed("ERR: 任务作业异常：%s" % e)
+        finally:
+            if lock_fd is not None:
+                _release_lock(lock_fd)
+            cb, self.on_exit = self.on_exit, None
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+            self._settle(outcome, code)
+
+    def _settle(self, state: str, code):
+        """落终态。只有这里能把状态改成终态，保证收尾动作已经跑完。"""
+        with self._lock:
+            if self.state in ("done", "failed", "cancelled"):
+                return                        # 已收尾（重复调用无害）
+            self.state = state
+            self.exit_code = code
+            self.ended_at = time.time()
+
+    def cancel(self) -> dict:
+        """终止子进程。先 SIGTERM 让它自己收尾，超时再 SIGKILL。
+
+        脚本对 SIGTERM 没有专门处理，但 Python 的默认行为就是退出；给它时间是为了
+        让已发出的上报请求走完（半途丢弃会让上游状态不明）。
+        """
+        with self._lock:
+            if self.state not in ("pending", "running"):
+                return {"ok": False, "error": "没有正在运行的作业"}
+            self._cancelling = True
+            proc = self._proc
+        self.prog.feed("ERR: 收到取消请求，正在终止（已完成未领奖的可稍后「只领奖」补）")
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as e:
+                return {"ok": False, "error": "终止失败：%s" % e}
+        # 等 _run 观察到进程退出并落终态（它负责释放面板互斥）
+        deadline = time.time() + 10
+        while self.running and time.time() < deadline:
+            time.sleep(0.05)
+        return {"ok": True}
+
+
+def _count_statuses(items) -> dict:
+    out = {}
+    for it in items:
+        s = it.get("status") or "unknown"
+        out[s] = out.get(s, 0) + 1
+    return out
+
+
+def _acquire_lock(path: str):
+    """非阻塞抢一把 flock。抢不到返回 None（已有作业在跑）。
+
+    面板进程内的互斥用 _task_busy；这把锁是给「同一台机器上另一个面板实例」
+    或运维手动跑的脚本看的 —— 脚本本身不持锁，所以它挡不住网关排程（见设计文档
+    第七节的已知边界）。
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 面板业务逻辑
+# ──────────────────────────────────────────────────────────────────────
+
 class Panel:
     """面板的全部业务逻辑。与 HTTP 层分离，便于测试。"""
 
@@ -321,6 +806,9 @@ class Panel:
         self._lock = threading.Lock()
         self._login_busy = threading.Lock()
         self.session = {"gen": 0, "stage": "idle", "message": "", "url": "", "realm": ""}
+        # 任务作业：同一时刻只允许一个（重复点击 409）。job 是当前/最近一次。
+        self._task_busy = threading.Lock()
+        self.job: "TaskJob | None" = None
 
     # — 网关转发 —————————————————————————————————————————
     def gateway(self, path: str, timeout=60):
@@ -443,9 +931,11 @@ class Panel:
                 "credit": self.cfg.can_credit,
                 "checkin": self.cfg.can_checkin,
                 "trial": self.cfg.can_trial,
+                "tasks": self.cfg.can_tasks,
                 "auth_dir": str(self.cfg.auth_dir) if self.cfg.auth_dir else "",
                 "bin_dir": str(self.cfg.bin_dir) if self.cfg.bin_dir else "",
             },
+            "tasks": self.task_capability(),
         }
 
     def _port_suffix(self) -> str:
@@ -590,8 +1080,168 @@ class Panel:
             self.session = {"gen": self.session.get("gen", 0) + 1, "stage": "idle",
                             "message": "", "url": "", "realm": ""}
 
+    # — 一键任务（跑网关自带的 task_runner.py / school_open_day_2026.py）———
+    #
+    # 这是既有的「面板调网关 CLI」通路的延伸（签到/积分/试用同一条路），不是新架构：
+    # 脚本自己读 auths/，凭据既不经过面板也不进面板进程内存。
+    def _task_env(self) -> dict:
+        """子进程环境。
+
+        PYTHONUNBUFFERED 是这套方案里最容易踩的坑：不设的话脚本照常跑完，但面板在
+        整个运行期间一行输出都收不到，界面看起来像卡死 —— 而进程其实完全正常。
+        PYTHONIOENCODING 兜住服务器 LANG=C 的场景（非 ASCII 打印会炸）。
+        WB2A_AUTHS 让脚本按面板解析到的同一处找凭据（面板若用 --auth-dir 覆盖过）。
+        """
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        if self.cfg.auth_dir:
+            env["WB2A_AUTHS"] = str(self.cfg.auth_dir)
+        return env
+
+    def _task_cwd(self):
+        """子进程工作目录：脚本按 cwd 找 auths/ 与 scripts/，所以用 bin_dir（网关 app/）。
+
+        bin_dir 缺失也不能用面板目录 —— 脚本会找不到凭据。返回 None 让调用方报错。
+        """
+        return str(self.cfg.bin_dir) if self.cfg.bin_dir else None
+
+    def _script_argv(self, script: str, args: list) -> list:
+        script_path = self.cfg.task_script(script)
+        return [self.cfg.python_exe, str(script_path)] + args
+
+    def _account_args(self, accounts) -> list:
+        """账号入参：用完整 auths 文件名而不是 uid 前缀。
+
+        load_auth() 对含路径分隔或 .json 结尾的入参按文件名精确匹配 —— 用 uid 前缀
+        会撞号（abc123 命中 abc1234 的凭据）。
+        """
+        out = []
+        for a in (accounts or []):
+            a = str(a).strip()
+            if not a:
+                continue
+            if a.upper() == "ALL":
+                out.append("ALL")
+            elif a.endswith(".json"):
+                out.append(a)
+            else:
+                out.append("workbuddy-%s.json" % a)
+        return out or ["ALL"]
+
+    def task_start(self, kind: str, accounts=None, only_claim: bool = False,
+                   only=None, gap=None, mode: str = "run") -> dict:
+        """启动一个任务作业。立即返回，不阻塞到脚本结束。"""
+        if not self.cfg.can_tasks:
+            missing = []
+            if self.cfg.task_script("task_runner.py") is None:
+                missing.append("任务脚本（scripts/task_runner.py）")
+            if not self.cfg.auth_dir:
+                missing.append("凭据目录（--auth-dir）")
+            if not self.cfg.python_exe:
+                missing.append("python3 解释器")
+            return {"error": "一键任务需要与网关同机部署，当前缺少：%s。"
+                             "可改用网关自带的 ./scripts/task_runner.py 直接在命令行跑。"
+                             % "、".join(missing)}
+
+        cwd = self._task_cwd()
+        if not cwd:
+            return {"error": "未检测到网关程序目录（--bin-dir），无法确定脚本的工作目录。"
+                             "脚本要靠它找到 auths/。"}
+        if not self._task_busy.acquire(blocking=False):
+            cur = self.job
+            return {"error": "已有任务作业在执行（%s）。等它结束或先取消。" % (
+                cur.label if cur else "未知"),
+                "busy": True, "job": cur.id if cur else ""}
+
+        if kind == "school":
+            act = {"list": ["--list"], "run": ["--run", "--yes"],
+                   "lottery": ["--lottery-only", "--yes"]}.get(mode, ["--list"])
+            argv = self._script_argv("school_open_day_2026.py",
+                                     self._account_args(accounts) + act)
+            label = {"list": "开学季盘点", "run": "开学季执行",
+                     "lottery": "开学季抽奖"}.get(mode, "开学季")
+            script = "school_open_day_2026.py"
+        else:
+            argv = self._script_argv("task_runner.py", self._account_args(accounts))
+            if kind == "scan":
+                label = "扫描待办（只读）"
+            else:
+                argv.append("--yes")
+                label = "一键完成（只领奖）" if only_claim else "一键完成全部任务"
+            if only_claim:
+                argv.append("--only-claim")
+            for code in (only or []):
+                if str(code).strip():
+                    argv += ["--only", str(code).strip()]
+            if gap:
+                try:
+                    g = float(gap)
+                    if g >= 1.0:
+                        argv += ["--gap", str(g)]
+                except (TypeError, ValueError):
+                    pass
+            script = "task_runner.py"
+
+        # 脚本指纹：真实存在才可能跑起来（can_tasks 已判 task_runner；school 单独确认）
+        if self.cfg.task_script(script) is None:
+            self._task_busy.release()
+            return {"error": "缺少脚本 %s（网关 scripts/ 目录下未找到）" % script}
+
+        # 收尾回调在作业线程里释放互斥：与「running 翻 False」同一时刻发生，
+        # 不存在「界面以为结束了、锁还没放」的窗口（早先的 reaper 轮询有 0.3s 竞态）。
+        job = TaskJob(kind, argv, cwd, self._task_env(), label, TaskProgress(),
+                      lockfile=str(HERE / "tasks.lock"), on_exit=self._release_task_busy)
+        self.job = job
+        try:
+            job.start()
+        except Exception as e:
+            self._release_task_busy()
+            self.job = None
+            return {"error": "启动失败：%s" % e}
+
+        return {"ok": True, "job": job.id, "label": label, "argv": argv,
+                "write": job.write, "started": job.started_at}
+
+    def _release_task_busy(self):
+        try:
+            self._task_busy.release()
+        except RuntimeError:
+            pass
+
+    def task_status(self, since=None) -> dict:
+        job = self.job
+        if job is None:
+            out = {"job": "", "state": "idle", "running": False, "items": [],
+                   "summary": {}, "accounts": {}, "counts": {}, "log_lines": 0}
+            if since is not None:
+                out["lines"] = []
+            return out
+        return job.snapshot(since)
+
+    def task_cancel(self) -> dict:
+        if self.job is None or not self.job.running:
+            return {"ok": False, "error": "没有正在运行的任务作业"}
+        return self.job.cancel()
+
+    def task_capability(self) -> dict:
+        """任务中心的能力与前置条件，供界面决定按钮可用性。"""
+        script = self.cfg.task_script("task_runner.py")
+        school = self.cfg.task_script("school_open_day_2026.py")
+        return {
+            "enabled": self.cfg.can_tasks,
+            "script_dir": str(self.cfg.resolved_script_dir or ""),
+            "task_runner": str(script) if script else "",
+            "school_script": str(school) if school else "",
+            "python": self.cfg.python_exe or "",
+            "has_school": school is not None,
+            "auth_dir": str(self.cfg.auth_dir) if self.cfg.auth_dir else "",
+        }
+
     # — 账号运维（走网关管理端点，需上游支持）————————————————
     def account_op(self, action: str, uid: str, reason: str = ""):
+        # enable 分支不带 body，disable 才带 reason —— 必须显式初始化，
+        # 否则 enable 走到 http() 时会 UnboundLocalError（曾因删掉这行踩过）。
         payload = None
         if action == "disable":
             payload = json.dumps({"reason": reason or "panel"}).encode()
@@ -761,6 +1411,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login/status":
             with p._lock:
                 return self._send(200, dict(p.session))
+        if path == "/api/tasks/status":
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            try:
+                since = int((q.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0
+            return self._send(200, p.task_status(since))
         if path.startswith("/api/cline/"):
             return self._cline_get(path)
         return self._send(404, {"error": "not found"})
@@ -816,6 +1473,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p.run_tool("signin_bin"))
         if path == "/api/trial":
             return self._send(200, p.run_tool("trial_bin"))
+        # — 一键任务 ——————————————————————————————————————
+        # 写操作（run/school）会向腾讯发真实上报请求；scan 全程只读。
+        if path in ("/api/tasks/scan", "/api/tasks/run"):
+            accounts = body.get("accounts") or []
+            if isinstance(accounts, str):
+                accounts = [a for a in accounts.split(",") if a.strip()]
+            only = body.get("only") or []
+            if isinstance(only, str):
+                only = [a for a in only.split(",") if a.strip()]
+            kind = "scan" if path.endswith("scan") else "run"
+            return self._send(200, p.task_start(
+                kind, accounts=accounts, only_claim=bool(body.get("only_claim")),
+                only=only, gap=body.get("gap")))
+        if path == "/api/tasks/school":
+            mode = (body.get("mode") or "list").strip().lower()
+            if mode not in ("list", "run", "lottery"):
+                return self._send(400, {"error": "mode 只能是 list / run / lottery"})
+            return self._send(200, p.task_start(
+                "school", accounts=body.get("accounts") or [], mode=mode))
+        if path == "/api/tasks/cancel":
+            r = p.task_cancel()
+            return self._send(200 if r.get("ok") else 409, r)
         if path.startswith("/api/cline/"):
             c, err = self._cline()
             if c is None:
@@ -861,6 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--key", help="网关 api_key")
     ap.add_argument("--auth-dir", help="账号凭据目录（启用「新增账号」需要）")
     ap.add_argument("--bin-dir", help="网关程序目录（含 login/credit 等工具）")
+    ap.add_argument("--script-dir", help="网关任务脚本目录（默认从 bin-dir 推 scripts/）")
     ap.add_argument("--gateway-config", help="网关 config.json 路径（默认自动探测）")
     ap.add_argument("--cline-config",
                     help="cline2api 网关的 config.json 路径（默认 /opt/cline2api/config.json）")
@@ -903,6 +1583,8 @@ def main(argv=None) -> int:
         caps.append("签到")
     if cfg.can_trial:
         caps.append("试用领取")
+    if cfg.can_tasks:
+        caps.append("一键任务")
 
     # flush=True 是必要的：stdout 非 tty（重定向 / Docker 日志）时 Python 会缓冲，
     # 用户看不到启动信息会以为卡死。
