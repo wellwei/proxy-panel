@@ -46,9 +46,9 @@ STATUS = {
          "requests": 3, "last_observed": "2026-09-20T01:00:00Z", "probe_streak": 0},
         {"upstream": "anthropic/claude-opus-5", "bare": "claude-opus-5",
          "group": "recommended", "state": "disabled", "exposed": False,
-         "last_cost": 0.0001, "cost_total": 0.0001, "requests": 1,
+         "last_cost": 65, "cost_total": 65, "requests": 1,
          "last_observed": "2026-09-20T01:00:00Z",
-         "disable_reason": "probe cost=0.0001 billing=true", "probe_streak": 0},
+         "disable_reason": "probe credits=65", "probe_streak": 0},
     ],
     "catalog": {"last_sync": "2026-09-20T01:00:00Z", "error": ""},
 }

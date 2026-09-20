@@ -418,6 +418,31 @@ class TestClineSmoke(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["total"], 3)
 
+    def test_cline_ledger_shows_credits_not_market_price(self):
+        """台账展示的必须是「真实扣费积分」，不能说成成本/市场价。
+
+        2026-09-20 的误判就是拿响应里的市场参考价当计费信号；面板若把这块
+        标成「成本」，运维会照旧按错的口径理解闸门。
+        """
+        _, html = _get("http://127.0.0.1:%d/" % CLINE_PANEL_PORT)
+        self.assertIn("最近扣费", html)
+        self.assertIn("累计扣费", html)
+        self.assertIn("积分台账", html)
+        # 面板文案要挑明响应里的 cost 字段不是判定依据
+        self.assertIn("市场参考价", html)
+        # 旧文案不得残留
+        self.assertNotIn("最近成本", html)
+        self.assertNotIn("累计成本", html)
+
+    def test_cline_ledger_values_are_credits(self):
+        """台账字段语义是积分：stub 的 65 表示扣了 65 积分，不是 0.0065 美元。"""
+        status, body = self._api("/api/cline/status")
+        self.assertEqual(status, 200)
+        models = {m["bare"]: m for m in json.loads(body)["models"]}
+        self.assertEqual(models["glm-5.3-flash"]["last_cost"], 0)
+        self.assertEqual(models["claude-opus-5"]["last_cost"], 65)
+        self.assertIn("credits", models["claude-opus-5"]["disable_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

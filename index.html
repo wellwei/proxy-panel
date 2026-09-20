@@ -254,9 +254,11 @@ button.sm{padding:5px 10px;font-size:12.5px;border-radius:6px}
     <div class="bar" id="clineBar"></div>
 
     <div class="warnbox">
-      <b>定价闸门</b>：模型先探针后放行（cost=0 才入池），每条真实响应复核上游计费成本，
-      一旦 &gt;0 立即自动关停并摘出渠道 —— 所以「已关停」是<b>正常保护结果</b>，不是故障。
-      手动启用仍受运行期成本观测约束（成本永远赢）。
+      <b>定价闸门</b>：模型先探针后放行，每条真实响应按 generation id 回查 Cline 后台
+      <b>积分台账</b>，确认真实扣了积分才关停并摘出渠道 —— 所以「已关停」是<b>正常保护结果</b>，
+      不是故障。
+      注意：响应里的 cost 字段是<b>市场参考价</b>，免费模型也非零，不作为判定依据。
+      手动启用仍受运行期积分观测约束（积分永远赢）。
     </div>
 
     <div class="sect" style="margin-top:22px">
@@ -807,9 +809,9 @@ async function loadCline() {
       <div class="meta">${esc(m.upstream)}</div>
       <div class="kv">
         <span class="k">请求</span><span class="v">${m.requests ?? 0}</span>
-        <span class="k">最近成本</span><span class="v" style="color:${
-          (m.last_cost || 0) > 0 ? 'var(--err)' : 'inherit'}">${m.last_cost ?? 0}</span>
-        <span class="k">累计成本</span><span class="v">${m.cost_total ?? 0}</span>
+        <span class="k">最近扣费</span><span class="v" style="color:${
+          (m.last_cost || 0) > 0 ? 'var(--err)' : 'inherit'}">${m.last_cost ?? 0} 积分</span>
+        <span class="k">累计扣费</span><span class="v">${m.cost_total ?? 0} 积分</span>
         <span class="k">最近观测</span><span class="v">${fmtTime(m.last_observed)}</span>
         ${m.probe_streak ? `<span class="k">复测连过</span><span class="v">${m.probe_streak}/3</span>` : ''}
         ${m.disable_reason ? `<span class="k">关停原因</span><span class="v">${esc(m.disable_reason)}</span>` : ''}
@@ -817,9 +819,9 @@ async function loadCline() {
       <div class="acts">
         ${m.exposed
           ? `<button class="sm" onclick="clineModel(false,'${esc(m.upstream)}')">手动关停</button>
-             ${m.manual ? '<span class="note">（手动启用中，成本观测仍生效）</span>' : ''}`
+             ${m.manual ? '<span class="note">（手动启用中，积分观测仍生效）</span>' : ''}`
           : `<button class="sm" onclick="clineModel(true,'${esc(m.upstream)}')">手动启用</button>
-             <span class="note">启用后先经探针，cost=0 才真正放行</span>`}
+             <span class="note">启用后按积分台账核对，确认为免费才放行</span>`}
       </div>
     </div>`;
   }).join('') : '<div class="empty">闸门台账为空（目录还没同步？）</div>';

@@ -34,7 +34,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
