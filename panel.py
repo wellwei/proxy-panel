@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -1344,6 +1344,14 @@ class ClinePanel:
             return {"error": "cline2api %d: %s" % (code, extract_error_message(res) or str(res)[:160])}
         return {"ok": True, "account": account_id, "enabled": enable}
 
+    def clear_cooldown(self, account_id: str) -> dict:
+        """清掉账号的冷却（账号级 + 全部模型级限额）。"""
+        quoted = urllib.parse.quote(account_id, safe="")
+        code, res = self._req("POST", "/admin/accounts/%s/clear-cooldown" % quoted)
+        if code != 200:
+            return {"error": "cline2api %d: %s" % (code, extract_error_message(res) or str(res)[:160])}
+        return {"ok": True, "account": account_id, "cleared": True}
+
     def recheck(self):
         code, res = self._req("POST", "/admin/gate/recheck")
         if code != 200:
@@ -1520,6 +1528,11 @@ class Handler(BaseHTTPRequestHandler):
             if not aid:
                 return self._send(400, {"error": "缺少 id"})
             return self._send(200, c.account_op(path.endswith("enable"), aid))
+        if path == "/api/cline/account/clear-cooldown":
+            aid = (body.get("id") or "").strip()
+            if not aid:
+                return self._send(400, {"error": "缺少 id"})
+            return self._send(200, c.clear_cooldown(aid))
         return self._send(404, {"error": "not found"})
 
 

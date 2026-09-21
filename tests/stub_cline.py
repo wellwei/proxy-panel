@@ -33,7 +33,11 @@ STATUS = {
     "accounts": [
         {"accountId": "acc_1", "email": "abc***@gmail.com", "status": "active",
          "requestsTotal": 12, "requestsToday": 3, "tokensTotal": 4567,
-         "tokensToday": 100, "createdAt": "2026-09-20T00:00:00Z"},
+         "tokensToday": 100, "createdAt": "2026-09-20T00:00:00Z",
+         # 模型级限额：账号仍可用，只是这个模型今日额度用尽（免费额度按账号×模型计）
+         "modelCooldowns": [{"model": "cline-free/deepseek-v4.1-flash",
+                             "until": "2026-09-21T18:03:18Z",
+                             "reason": "429 model limit: Daily free limit reached"}]},
         {"accountId": "acc_2", "email": "def***@qq.com", "status": "cooldown",
          "manualDisabled": True, "lastReason": "429: Try again in 17h 59m",
          "cooldownUntil": "2026-09-21T00:00:00Z",
@@ -60,6 +64,8 @@ MODELS = {
 
 # 被面板操作过的模型 id 记在这里，测试据此断言转义与转发都正确
 TOGGLED: list = []
+# 账号操作（含 clear-cooldown）同理
+CLEARED: list = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -82,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "version": "stub"})
         if path == "/__toggled":
             # 仅测试用：把收到的启停请求回给测试进程（跨进程断言转义是否正确）
-            return self._send(200, {"toggled": TOGGLED})
+            return self._send(200, {"toggled": TOGGLED, "cleared": CLEARED})
         if path == "/status":
             if not self._auth_ok(ADMIN_TOKEN):
                 return self._send(401, {"error": {"message": "invalid admin token",
@@ -123,7 +129,10 @@ class Handler(BaseHTTPRequestHandler):
         if "/admin/accounts/" in path:
             rest = path[len("/admin/accounts/"):]
             quoted, _, action = rest.rpartition("/")
+            # clear-cooldown 是三段式路径里的最后一个动作段
+            CLEARED.append((urllib.parse.unquote(quoted), action))
             return self._send(200, {"ok": True, "account": urllib.parse.unquote(quoted),
+                                    "cleared": action == "clear-cooldown",
                                     "enabled": action == "enable"})
         return self._send(404, {"error": {"message": "not found"}})
 

@@ -832,9 +832,12 @@ async function loadCline() {
       : st2 === 'cooldown' ? '<span class="tag warn">冷却中</span>'
       : st2 === 'expired' ? '<span class="tag err">凭据失效</span>'
       : `<span class="tag warn">${esc(st2)}</span>`;
+    // 模型级限额（免费额度按账号×模型计）：账号仍在轮转，只是这几个模型不再派给它
+    const mcs = (a.modelCooldowns || []).filter(m => !isZeroTime(m.until));
     return `<div class="card ${a.manualDisabled || st2 !== 'active' ? 'off' : ''}">
       <div class="chead"><span class="name">${esc(a.email || a.accountId || '（无邮箱）')}</span>${tag}${
-        a.manualDisabled ? '<span class="tag warn">手动停用</span>' : ''}</div>
+        a.manualDisabled ? '<span class="tag warn">手动停用</span>' : ''}${
+        mcs.length ? `<span class="tag warn">${mcs.length} 个模型限额</span>` : ''}</div>
       <div class="meta">${esc(a.accountId || '')}</div>
       <div class="kv">
         <span class="k">请求数</span><span class="v">${a.requestsTotal ?? 0}（今日 ${a.requestsToday ?? 0}）</span>
@@ -842,11 +845,15 @@ async function loadCline() {
         ${a.lastReason ? `<span class="k">最近原因</span><span class="v">${esc(a.lastReason)}</span>` : ''}
         ${!isZeroTime(a.cooldownUntil) ? `<span class="k">冷却至</span><span class="v">${
           fmtTime(a.cooldownUntil)}</span>` : ''}
+        ${mcs.map(m => `<span class="k">限额模型</span><span class="v">${
+          esc(m.model)} → ${fmtTime(m.until)}（其他模型不受影响）</span>`).join('')}
       </div>
       <div class="acts">
         ${a.manualDisabled
           ? `<button class="sm" onclick="clineAcct(true,'${esc(a.accountId)}')">恢复启用</button>`
           : `<button class="sm" onclick="clineAcct(false,'${esc(a.accountId)}')">临时停用</button>`}
+        ${(st2 === 'cooldown' || mcs.length)
+          ? `<button class="sm" onclick="clineClearCd('${esc(a.accountId)}')">清除冷却</button>` : ''}
       </div>
     </div>`;
   }).join('') : '<div class="empty">账号池是空的。点上方「+ 新增 Cline 账号」用浏览器授权一次即可。</div>';
@@ -895,6 +902,13 @@ async function clineAcct(enable, id) {
   const r = await api('/cline/account/' + (enable ? 'enable' : 'disable'),
                       {method: 'POST', body: JSON.stringify({id: id})});
   toast(r.ok ? (enable ? '已恢复账号' : '已停用账号') : ('失败：' + (r.error || '')), 4000);
+  loadCline();
+}
+
+async function clineClearCd(id) {
+  const r = await api('/cline/account/clear-cooldown',
+                      {method: 'POST', body: JSON.stringify({id: id})});
+  toast(r.ok ? '已清除该账号的冷却（账号级 + 全部模型级限额）' : ('失败：' + (r.error || '')), 4000);
   loadCline();
 }
 

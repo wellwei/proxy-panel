@@ -359,6 +359,29 @@ class TestClineSmoke(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["ok"])
 
+    def test_cline_account_clear_cooldown_routes(self):
+        """清除冷却打到网关的 clear-cooldown 端点（不是 enable/disable）。"""
+        status, body = self._post("/api/cline/account/clear-cooldown", {"id": "acc_1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["cleared"])
+        _, tb = _get("http://127.0.0.1:%d/__toggled" % CLINE_PORT)
+        self.assertIn(["acc_1", "clear-cooldown"], json.loads(tb)["cleared"])
+
+    def test_cline_account_clear_cooldown_requires_id(self):
+        status, body = self._post("/api/cline/account/clear-cooldown", {})
+        self.assertEqual(status, 400)
+        self.assertIn("id", json.loads(body)["error"])
+
+    def test_cline_models_show_per_model_limits(self):
+        """模型级限额透传到前端：带模型名与到期时间，且账号本身仍可用。"""
+        _, body = self._api("/api/cline/status")
+        accts = json.loads(body)["accounts"]
+        first = [a for a in accts if a["accountId"] == "acc_1"][0]
+        self.assertEqual(first["status"], "active")
+        mc = first["modelCooldowns"][0]
+        self.assertEqual(mc["model"], "cline-free/deepseek-v4.1-flash")
+        self.assertIn("until", mc)
+
     def test_cline_recheck(self):
         status, body = self._post("/api/cline/recheck", {})
         self.assertEqual(status, 200)
