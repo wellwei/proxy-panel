@@ -1,0 +1,23 @@
+# /etc/systemd/system/wb2a-panel.service — wb2a 管理面板（只绑回环，SSH 隧道访问）
+# 访问: ssh -L 8321:127.0.0.1:8321 api  →  http://127.0.0.1:8321
+[Unit]
+Description=wb2a-panel (wb2a admin panel, loopback only)
+After=wb2a.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wb2a
+Group=wb2a
+WorkingDirectory=/opt/wb2a/manager
+ExecStart=/usr/bin/python3 /opt/wb2a/manager/panel.py --port 8321 --gateway-config /opt/wb2a/app/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/wb2a
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
