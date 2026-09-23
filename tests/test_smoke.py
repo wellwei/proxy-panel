@@ -413,6 +413,9 @@ class TestClineSmoke(unittest.TestCase):
         status, body = self._pub("/cline/")
         self.assertEqual(status, 200)
         self.assertIn("Cline 免费额度池", body)
+        # 页面会自己轮询，读者得知道眼前这份数字是什么时候的
+        self.assertIn('id="fresh"', body)
+        self.assertIn("每 30 秒自动刷新", body)
 
     def test_public_status_is_projected(self):
         """公开状态可用，且**不含**上游名、账号 id、网关地址这些内部信息。"""
@@ -426,7 +429,9 @@ class TestClineSmoke(unittest.TestCase):
                          ["glm-5.3-flash", "claude-opus-5"])
         for secret in ("z-ai/glm-5.3-flash", "cline-free/deepseek-v4.1-flash",
                        "acc_1", "acc_2", "acc_3", "127.0.0.1",
-                       "requestsTotal", "tokensTotal"):
+                       "requestsTotal", "tokensTotal",
+                       "4567",                     # 累计 token 不公开
+                       "9999"):                    # 昨天的量也不许当成今天冒出来
             self.assertNotIn(secret, body, "公开面泄漏了 %s" % secret)
 
     def test_public_accounts_are_listed_but_masked(self):
@@ -445,6 +450,19 @@ class TestClineSmoke(unittest.TestCase):
         # 每条都带状态，前端才知道怎么标注
         for a in accts:
             self.assertIn(a["state"], ("active", "cooldown", "paused", "expired", "unknown"))
+            self.assertIn("tokens_today", a, "每条都要有今日用量，前端才渲染得出来")
+
+    def test_public_account_tokens_are_todays_only(self):
+        """「今日已用 token」要按**日期**判，而不是照抄网关的 tokensToday。
+
+        网关是惰性重置：昨天用过、今天还没被派活的账号仍挂着昨天的数。stub 里
+        acc_2 就是这个形态（tokensToday=9999 但 tokensDate 是 2020 年），公开面
+        必须给 0 —— 否则页面上会把昨天的量报成今天。
+        """
+        _, body = self._pub("/cline/api/status")
+        by = {a["name"]: a for a in json.loads(body)["accounts"]}
+        self.assertEqual(by["abc***@gmail.com"]["tokens_today"], 1234)
+        self.assertEqual(by["def***@qq.com"]["tokens_today"], 0)
 
     def test_public_contribute_flow(self):
         """贡献链路：start 拿授权地址 → poll 报成功。"""

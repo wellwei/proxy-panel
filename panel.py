@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -1315,11 +1315,12 @@ def _public_email(email: str) -> str:
     return "%s***@%s" % (visible, domain)
 
 
-def _public_account(a: dict) -> dict:
-    """公开面的账号条目：打码邮箱 + 现在能不能用 + 恢复时间。
+def _public_account(a: dict, today: str = "") -> dict:
+    """公开面的账号条目：打码邮箱 + 今日已用 token + 现在能不能用 + 恢复时间。
 
     刻意不含 accountId（公开面无法对它做任何操作，少一个标识少一分枚举面），
-    也不含请求数/token 量 —— 那些是运营口径。
+    也不含**累计**请求数/token 量 —— 那些是运营口径。今日 token 是例外：它是
+    「这个池子今天消耗了多少」的一部分，公开页拿它说明额度为什么变紧。
     """
     status = a.get("status") or "active"
     if a.get("manualDisabled"):
@@ -1327,9 +1328,16 @@ def _public_account(a: dict) -> dict:
     limits = [m for m in (a.get("modelCooldowns") or [])
               if isinstance(m, dict) and _not_zero_time(m.get("until"))]
     until = a.get("cooldownUntil") or ""
+    # 跨日重置在网关是**惰性**的（RecordUsage 里遇到新日期才清零），所以一个昨天
+    # 用过、今天还没被派活的账号，tokensToday 仍挂着昨天的数。直接透传会把昨天的
+    # 量报成「今日」—— 网关自己的 CostToday 就是这么判的（日期不符给 0），同口径。
+    tokens_today = a.get("tokensToday") or 0
+    if (a.get("tokensDate") or "") != (today or time.strftime("%Y-%m-%d")):
+        tokens_today = 0
     return {
         "name": _public_email(a.get("email") or ""),
         "state": _PUBLIC_ACCOUNT_STATE.get(status, "unknown"),
+        "tokens_today": tokens_today,
         # 冷却截止时间只对冷却中的账号有意义，别的一律给空串（不给无用字段）
         "until": until if status == "cooldown" and _not_zero_time(until) else "",
         "limits": len(limits),
@@ -1357,11 +1365,13 @@ def _public_status(st: dict) -> dict:
 
     刻意不含：**完整**邮箱与账号 id（邮箱只给打码后的前 3 个字符）、
     上游模型名（含分区与线路）、闸门台账的技术细节（last_cost / disable_reason /
-    probe_streak）、邮箱的请求量统计、网关地址与 api_key（接入信息只归管理员）。
+    probe_streak）、**累计**用量（只给今日 token）、网关地址与 api_key（接入信息只归管理员）。
     """
     models = [_public_model(m) for m in (st.get("models") or []) if isinstance(m, dict)]
     active = [m for m in models if m["state"] == "active"]
-    accounts = [_public_account(a) for a in (st.get("accounts") or []) if isinstance(a, dict)]
+    today = time.strftime("%Y-%m-%d")
+    accounts = [_public_account(a, today)
+                for a in (st.get("accounts") or []) if isinstance(a, dict)]
     # 排稳定序：能出力的排前面，同组按打码名。不给公开面看池子的内部顺序。
     rank = {"active": 0, "cooldown": 1, "paused": 2, "expired": 3}
     accounts.sort(key=lambda a: (rank.get(a["state"], 9), a["name"]))

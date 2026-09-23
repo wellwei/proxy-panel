@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -490,11 +491,16 @@ class TestPublicProjection(unittest.TestCase):
         "accounts": [
             {"accountId": "acc_1", "email": "abc***@gmail.com", "status": "active",
              "refreshToken": "SECRET-RT", "requestsTotal": 12, "tokensTotal": 4567,
+             "requestsToday": 4, "tokensToday": 1234,
+             "tokensDate": time.strftime("%Y-%m-%d"),
              "modelCooldowns": [{"model": "cline-free/deepseek-v4.1-flash",
                                  "until": "2026-09-21T18:03:18Z",
                                  "reason": "SECRET-REASON"}]},
+            # 昨天用过、今天还没被派活：tokensToday 挂着昨天的数（网关是惰性重置），
+            # 公开面必须按日期归零，否则「今日已用」报的是昨天的量
             {"accountId": "acc_2", "email": "def***@qq.com", "status": "cooldown",
              "cooldownUntil": "2026-09-21T00:00:00Z",
+             "tokensToday": 9999, "tokensDate": "2020-01-01",
              "lastReason": "429: Try again in 17h", "manualDisabled": True},
             # 短邮箱：网关自己的打码在这个形状上会**原样返回完整地址**
             # （MaskEmail 的兜底分支），是公开面最需要挡住的一种
@@ -529,7 +535,7 @@ class TestPublicProjection(unittest.TestCase):
         for m in out["models"]:
             self.assertEqual(set(m), {"name", "group", "state", "accounts"})
         for a in out["accounts"]:
-            self.assertEqual(set(a), {"name", "state", "until", "limits"})
+            self.assertEqual(set(a), {"name", "state", "tokens_today", "until", "limits"})
 
     def test_no_sensitive_value_survives_projection(self):
         """整份输出序列化后搜哨兵值 —— 比逐字段断言更能挡住「加了个新字段」的回归。
@@ -543,8 +549,38 @@ class TestPublicProjection(unittest.TestCase):
                        "acc_1", "acc_2", "acc_3",
                        "ab@x.com",                     # 短邮箱：完整地址必须被挡住
                        "z-ai/glm-5.3-flash", "anthropic/claude-opus-5",
-                       "127.0.0.1:7862"):
+                       "127.0.0.1:7862",
+                       "4567",                         # 累计 token 不公开（只给今日）
+                       "9999"):                        # 昨天残留的量也不许冒出来
             self.assertNotIn(secret, blob, "公开面泄漏了 %s" % secret)
+
+    def test_tokens_today_only_for_the_current_date(self):
+        """「今日已用」必须是**今天**的量。
+
+        网关上 tokensToday 是惰性重置的：昨天用过、今天还没被派活的账号仍挂着
+        昨天的数。直接透传会让公开面把昨天的量报成今天 —— 这条断言盯的就是它。
+        """
+        out = panel._public_status(self.RICH_STATUS)
+        by = {a["name"]: a for a in out["accounts"]}
+        self.assertEqual(by["abc***@gmail.com"]["tokens_today"], 1234)  # 日期是今天
+        self.assertEqual(by["def***@qq.com"]["tokens_today"], 0)        # 日期是昨天 → 归零
+        self.assertEqual(by["ab***@x.com"]["tokens_today"], 0)          # 网关没给这个字段
+
+    def test_tokens_today_survives_a_gateway_without_dates(self):
+        """打码后的 /status 若整条没有 tokensDate，也不能把上个世纪的量当今天。
+
+        真实网关每条都带 tokensDate；但字段缺失时要往「0」倒，不能往「照抄」倒。
+        """
+        out = panel._public_account({"email": "x***@y.com", "tokensToday": 777})
+        self.assertEqual(out["tokens_today"], 0)
+
+    def test_tokens_today_is_an_integer_for_rendering(self):
+        """前端直接 toLocaleString，必须是数字；网关给了 null/负数也不崩。"""
+        for raw in (None, 0, -5, 12.9):
+            out = panel._public_account(
+                {"email": "a***@b.com", "tokensToday": raw,
+                 "tokensDate": time.strftime("%Y-%m-%d")})
+            self.assertIsInstance(out["tokens_today"], (int, float))
 
     def test_accounts_are_listed_with_masked_emails(self):
         """账号池下拉要有东西可显示：每个账号一条，邮箱是打码的。"""

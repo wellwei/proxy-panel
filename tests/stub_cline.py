@@ -21,12 +21,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ADMIN_TOKEN = "stub-admin"
 API_KEY = "stub-key"
 PUBLIC_DEVICE = "pub-dev-1"   # 公开面贡献会话的 device_code
+
+# 网关的今日用量按日期惰性重置，日期串就是它的「今天」判据 —— 所以这里要**当天**的日期。
+TODAY = time.strftime("%Y-%m-%d")
 
 STATUS = {
     "version": "stub",
@@ -36,15 +40,19 @@ STATUS = {
     "accounts": [
         {"accountId": "acc_1", "email": "abc***@gmail.com", "status": "active",
          "requestsTotal": 12, "requestsToday": 3, "tokensTotal": 4567,
-         "tokensToday": 100, "createdAt": "2026-09-20T00:00:00Z",
+         "tokensToday": 1234, "tokensDate": TODAY,
+         "createdAt": "2026-09-20T00:00:00Z",
          # 模型级限额：账号仍可用，只是这个模型今日额度用尽（免费额度按账号×模型计）
          "modelCooldowns": [{"model": "cline-free/deepseek-v4.1-flash",
                              "until": "2026-09-21T18:03:18Z",
                              "reason": "429 model limit: Daily free limit reached"}]},
+        # tokensDate 是昨天：网关是惰性重置，今天还没被派活的账号仍挂着昨天的量。
+        # 公开面必须按日期归零 —— 所以这条的「今日已用」是 0，不是 9999。
         {"accountId": "acc_2", "email": "def***@qq.com", "status": "cooldown",
          "manualDisabled": True, "lastReason": "429: Try again in 17h 59m",
          "cooldownUntil": "2026-09-21T00:00:00Z",
          "requestsTotal": 5, "requestsToday": 1, "tokensTotal": 900,
+         "tokensToday": 9999, "tokensDate": "2020-01-01",
          "createdAt": "2026-09-20T00:00:00Z"},
         # 短邮箱：网关自己的 MaskEmail 在 local part 不足 3 字符时会**原样返回完整
         # 地址**，所以真实 /status 里会出现这种未打码的形态 —— 公开面必须自己再挡一层。
