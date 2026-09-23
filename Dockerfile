@@ -1,4 +1,4 @@
-# wb2a-panel —— 零依赖，镜像就是一个 Python 基础层 + 三个文件
+# wb2a-panel —— 零依赖，镜像就是一个 Python 基础层 + 四个文件
 FROM python:3.12-alpine
 
 LABEL org.opencontainers.image.title="wb2a-panel" \
@@ -6,7 +6,9 @@ LABEL org.opencontainers.image.title="wb2a-panel" \
       org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
-COPY panel.py index.html ./
+# public.html 是 Cline 公开面（/cline/）的页面。漏拷它只会让那条路径 500，
+# 管理面板照常工作 —— 这种缺件很容易一直没被发现，所以放在这行显式提醒。
+COPY panel.py index.html public.html ./
 
 # 不用 root 跑
 RUN adduser -D -u 10001 panel

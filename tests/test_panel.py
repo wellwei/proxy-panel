@@ -473,5 +473,113 @@ class TestLoadClineConfig(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
 
+class TestPublicProjection(unittest.TestCase):
+    """公开面投影：对外字段是**白名单**，网关新增字段不会自动流出去。
+
+    这里的断言不是「检查几个敏感字段被删掉了」——那种测法漏掉一个字段就是一次泄漏。
+    测法是反过来的：喂一份**塞满了敏感字段**的网关响应，然后断言公开面输出的
+    完整键集合恰好等于预期。多一个键就失败，所以网关将来加什么字段都不会漏网。
+    """
+
+    # 一份尽量贴近真实的 /status：凡是公开面不该出现的，都塞进来
+    RICH_STATUS = {
+        "version": "1.2.3",
+        "uptime_seconds": 4242,
+        "accounts_total": 3,
+        "accounts_available": 2,
+        "accounts": [
+            {"accountId": "acc_1", "email": "abc***@gmail.com", "status": "active",
+             "refreshToken": "SECRET-RT", "requestsTotal": 12, "tokensTotal": 4567,
+             "modelCooldowns": [{"model": "cline-free/deepseek-v4.1-flash",
+                                 "until": "2026-09-21T18:03:18Z",
+                                 "reason": "SECRET-REASON"}]},
+            {"accountId": "acc_2", "email": "def***@qq.com", "status": "cooldown",
+             "lastReason": "429: Try again in 17h", "manualDisabled": True},
+            {"accountId": "acc_3", "email": "ghi***@qq.com", "status": "active"},
+        ],
+        "models": [
+            {"upstream": "z-ai/glm-5.3-flash", "bare": "glm-5.3-flash", "group": "free",
+             "state": "free", "exposed": True, "last_cost": 0, "cost_total": 0,
+             "requests": 3, "probe_streak": 2, "manual": True,
+             "disable_reason": "SECRET-DISABLE", "accounts_available": 2},
+            {"upstream": "anthropic/claude-opus-5", "bare": "claude-opus-5",
+             "group": "recommended", "state": "disabled", "exposed": False,
+             "last_cost": 65, "cost_total": 65, "disable_reason": "probe credits=65",
+             "accounts_available": 0},
+        ],
+        "catalog": {"last_sync": "2026-09-20T01:00:00Z", "error": "SECRET-CATALOG-ERR"},
+        "gateway": "http://127.0.0.1:7862",
+        "api_key": "SECRET-API-KEY",
+    }
+
+    def test_model_projection_is_an_exact_whitelist(self):
+        out = panel._public_model(self.RICH_STATUS["models"][0])
+        self.assertEqual(set(out), {"name", "group", "state", "accounts"})
+
+    def test_status_projection_is_an_exact_whitelist(self):
+        out = panel._public_status(self.RICH_STATUS)
+        self.assertEqual(set(out), {
+            "version", "uptime_seconds", "accounts_total", "accounts_available",
+            "accounts_in_cooldown", "models_total", "models_active", "models",
+            "catalog_last_sync", "catalog_stale",
+        })
+        for m in out["models"]:
+            self.assertEqual(set(m), {"name", "group", "state", "accounts"})
+
+    def test_no_sensitive_value_survives_projection(self):
+        """整份输出序列化后搜哨兵值 —— 比逐字段断言更能挡住「加了个新字段」的回归。"""
+        blob = json.dumps(panel._public_status(self.RICH_STATUS), ensure_ascii=False)
+        for secret in ("SECRET-RT", "SECRET-REASON", "SECRET-DISABLE",
+                       "SECRET-CATALOG-ERR", "SECRET-API-KEY",
+                       "acc_1", "acc_2", "abc***@gmail.com",
+                       "z-ai/glm-5.3-flash", "anthropic/claude-opus-5",
+                       "127.0.0.1:7862"):
+            self.assertNotIn(secret, blob, "公开面泄漏了 %s" % secret)
+
+    def test_upstream_names_are_replaced_by_bare_names(self):
+        """上游名带分区/线路信息，公开面只给裸名（与模型广场同一口径）。"""
+        out = panel._public_status(self.RICH_STATUS)
+        self.assertEqual([m["name"] for m in out["models"]],
+                         ["glm-5.3-flash", "claude-opus-5"])
+
+    def test_state_is_translated_to_public_vocabulary(self):
+        """闸门内部状态名（free/exposed/unverified/disabled）不直接对外。"""
+        out = panel._public_status(self.RICH_STATUS)
+        self.assertEqual([m["state"] for m in out["models"]], ["active", "off"])
+        self.assertNotIn("exposed", json.dumps(out))
+
+    def test_counts_are_derived(self):
+        out = panel._public_status(self.RICH_STATUS)
+        self.assertEqual(out["models_total"], 2)
+        self.assertEqual(out["models_active"], 1)
+        self.assertEqual(out["accounts_in_cooldown"], 1)   # acc_2 是 cooldown
+        self.assertTrue(out["catalog_stale"])              # 目录同步报过错
+        self.assertEqual(out["catalog_last_sync"], "2026-09-20T01:00:00Z")
+
+    def test_empty_and_partial_payloads_do_not_crash(self):
+        """网关字段缺失/为空时也要给出可渲染的结果（公开面不能 500）。"""
+        for bad in ({}, {"models": None, "accounts": None}, {"models": [{}]},
+                    {"catalog": None}, {"accounts": ["not-a-dict"]}):
+            out = panel._public_status(bad)      # 不抛异常即通过
+            self.assertIn("models", out)
+            self.assertIsInstance(out["models"], list)
+
+    def test_unknown_state_is_not_passed_through(self):
+        """认不出的状态一律 unknown —— 不把内部状态名原样端出去。"""
+        out = panel._public_model({"bare": "x", "state": "some-internal-state"})
+        self.assertEqual(out["state"], "unknown")
+
+
+class TestRetryAfterParsing(unittest.TestCase):
+    """限流等待秒数从网关文案里抠；抠不到要有兜底。"""
+
+    def test_parses_seconds(self):
+        self.assertEqual(panel._retry_after_seconds("发起太频繁，请 42 秒后再试"), 42)
+
+    def test_falls_back_when_no_number(self):
+        self.assertEqual(panel._retry_after_seconds("稍后再试"), 60)
+        self.assertEqual(panel._retry_after_seconds(""), 60)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@
   /admin/models/{id}/{enable,disable} 手动启停（id 含 / 与 :，必须 URL 转义）
   /admin/accounts/{id}/{enable,disable}
   /admin/gate/recheck
+  /public/login/start|poll|cancel    公开面：贡献账号（未鉴权）
+  /public/capabilities               公开面能力探测（未鉴权）
 
 鉴权也照真实网关分两套（admin_token vs api_key），这样面板里用错 token 的
 情况能被测出来，而不是等到生产才发现。
@@ -24,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ADMIN_TOKEN = "stub-admin"
 API_KEY = "stub-key"
+PUBLIC_DEVICE = "pub-dev-1"   # 公开面贡献会话的 device_code
 
 STATUS = {
     "version": "stub",
@@ -44,15 +47,20 @@ STATUS = {
          "requestsTotal": 5, "requestsToday": 1, "tokensTotal": 900,
          "createdAt": "2026-09-20T00:00:00Z"},
     ],
+    # accounts_available 是**逐模型**的可用账号数（额度按账号×模型计）：真实网关
+    # 每条都带它，公开页据此区分「有账号能接」与「额度暂时用尽」。stub 少了它，
+    # 公开页会对所有模型都显示「额度用尽」—— 那样测出来的不是生产形态。
     "models": [
         {"upstream": "z-ai/glm-5.3-flash", "bare": "glm-5.3-flash", "group": "free",
          "state": "free", "exposed": True, "last_cost": 0, "cost_total": 0,
-         "requests": 3, "last_observed": "2026-09-20T01:00:00Z", "probe_streak": 0},
+         "requests": 3, "last_observed": "2026-09-20T01:00:00Z", "probe_streak": 0,
+         "accounts_available": 1},
         {"upstream": "anthropic/claude-opus-5", "bare": "claude-opus-5",
          "group": "recommended", "state": "disabled", "exposed": False,
          "last_cost": 65, "cost_total": 65, "requests": 1,
          "last_observed": "2026-09-20T01:00:00Z",
-         "disable_reason": "probe credits=65", "probe_streak": 0},
+         "disable_reason": "probe credits=65", "probe_streak": 0,
+         "accounts_available": 0},
     ],
     "catalog": {"last_sync": "2026-09-20T01:00:00Z", "error": ""},
 }
@@ -89,26 +97,43 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__toggled":
             # 仅测试用：把收到的启停请求回给测试进程（跨进程断言转义是否正确）
             return self._send(200, {"toggled": TOGGLED, "cleared": CLEARED})
-        if path == "/status":
-            if not self._auth_ok(ADMIN_TOKEN):
-                return self._send(401, {"error": {"message": "invalid admin token",
-                                                  "type": "unauthorized"}})
-            return self._send(200, STATUS)
-        if path == "/v1/models":
-            if not self._auth_ok(API_KEY):
-                return self._send(401, {"error": {"message": "invalid api key",
-                                                  "type": "unauthorized"}})
-            return self._send(200, MODELS)
         if path == "/admin/login/poll":
             code = (q.get("device_code") or [""])[0]
             if code != "dev-1":
                 return self._send(404, {"error": {"message": "unknown device_code"}})
             return self._send(200, {"state": "done", "email": "abc***@gmail.com",
                                     "account_id": "acc_1"})
+        if path == "/v1/models":
+            if not self._auth_ok(API_KEY):
+                return self._send(401, {"error": {"message": "invalid api key",
+                                                  "type": "unauthorized"}})
+            return self._send(200, MODELS)
+        # ── 公开面（未鉴权）────────────────────────────────────────────
+        # 刻意放在鉴权检查之前：这几条路由的真实形态就是不需要凭据。
+        if path == "/public/capabilities":
+            return self._send(200, {"contribute": True})
+        if path == "/public/login/poll":
+            code = (q.get("device_code") or [""])[0]
+            if code != PUBLIC_DEVICE:
+                return self._send(404, {"error": {"message": "unknown device_code"}})
+            # 公开面不回 account_id（少给一个标识少一分枚举面），只回打码邮箱
+            return self._send(200, {"state": "done", "email": "new***@gmail.com"})
+        if path == "/status":
+            if not self._auth_ok(ADMIN_TOKEN):
+                return self._send(401, {"error": {"message": "invalid admin token",
+                                                  "type": "unauthorized"}})
+            return self._send(200, STATUS)
         return self._send(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        # 公开面的写操作（贡献账号）同样不需要凭据
+        if path == "/public/login/start":
+            return self._send(200, {"device_code": PUBLIC_DEVICE, "user_code": "PUBL-0001",
+                                    "verify_url": "https://cline.bot/device?code=PUBL-0001",
+                                    "expires_in": 300})
+        if path == "/public/login/cancel":
+            return self._send(200, {"ok": True})
         if not self._auth_ok(ADMIN_TOKEN):
             return self._send(401, {"error": {"message": "invalid admin token",
                                               "type": "unauthorized"}})

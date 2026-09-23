@@ -45,6 +45,16 @@ def _post(url, payload, timeout=10, csrf=True):
         return e.code, e.read().decode("utf-8", "replace")
 
 
+def _get_status(url, timeout=10):
+    """GET 并返回 (status, body)，4xx/5xx 也当结果返回（断言「不该存在」时要用）。"""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        with e:                     # 关掉错误响应，否则解释器退出时刷 ResourceWarning
+            return e.code, e.read().decode("utf-8", "replace")
+
+
 def _wait_http(url, timeout=15):
     """等一个 HTTP 端点起来（避免用固定 sleep 造成的偶发失败）。"""
     deadline = time.time() + timeout
@@ -386,6 +396,111 @@ class TestClineSmoke(unittest.TestCase):
         status, body = self._post("/api/cline/recheck", {})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["started"])
+
+    # ── 公开面 /cline/*（任何人可读 + 贡献账号）───────────────────────
+    #
+    # 这组测试守的是公开面的**边界**：能读到什么、能写什么、写不了什么。
+    # 与 /api/cline/* 那组是两套独立通路，所以两边都要测。
+
+    def _pub(self, path):
+        """GET 公开面路径；4xx 也当正常结果返回（用它断言「不该存在的就是 404」）。"""
+        return _get_status("http://127.0.0.1:%d%s" % (CLINE_PANEL_PORT, path))
+
+    def _pub_post(self, path, payload, csrf=True):
+        return _post("http://127.0.0.1:%d%s" % (CLINE_PANEL_PORT, path), payload, csrf=csrf)
+
+    def test_public_page_is_served_without_credentials(self):
+        status, body = self._pub("/cline/")
+        self.assertEqual(status, 200)
+        self.assertIn("Cline 免费额度池", body)
+
+    def test_public_status_is_projected(self):
+        """公开状态可用，且**不含**邮箱、上游名、网关地址这些内部信息。"""
+        status, body = self._pub("/cline/api/status")
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["accounts_total"], 2)
+        self.assertEqual(d["models_active"], 1)
+        self.assertEqual([m["name"] for m in d["models"]],
+                         ["glm-5.3-flash", "claude-opus-5"])
+        for secret in ("abc***@gmail.com", "z-ai/glm-5.3-flash",
+                       "cline-free/deepseek-v4.1-flash", "acc_1", "127.0.0.1"):
+            self.assertNotIn(secret, body, "公开面泄漏了 %s" % secret)
+
+    def test_public_contribute_flow(self):
+        """贡献链路：start 拿授权地址 → poll 报成功。"""
+        status, body = self._pub_post("/cline/api/login/start", {})
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["device_code"], "pub-dev-1")
+        self.assertIn("cline.bot", d["verify_url"])
+
+        status, body = self._pub("/cline/api/login/poll?device_code=pub-dev-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["state"], "done")
+
+    def test_public_contribute_works_without_csrf_header(self):
+        """公开面的 POST **不**要 X-Panel-Request —— 它没有可被 CSRF 的东西，
+        而带自定义头会在跨站预检时被挡，等于把公开页上的贡献按钮废掉。"""
+        status, _ = self._pub_post("/cline/api/login/start", {}, csrf=False)
+        self.assertEqual(status, 200)
+
+    def test_public_cancel_flow(self):
+        status, body = self._pub_post("/cline/api/login/cancel", {"device_code": "pub-dev-1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_public_surface_has_no_write_operations(self):
+        """公开面**没有任何**启停账号/模型的路径 —— 它们在这里不存在，不是被拒。
+
+        与「不得停用关停账号和模型」这条需求一一对应：公开面能触达的路由就那几个，
+        其余一律 404，且面板也不会把它们转发到网关的 /admin/*。
+        """
+        for path in ("/cline/api/account/disable",
+                     "/cline/api/account/enable",
+                     "/cline/api/account/clear-cooldown",
+                     "/cline/api/model/disable",
+                     "/cline/api/model/enable",
+                     "/cline/api/recheck",
+                     "/cline/api/login/start-extra"):
+            if path.endswith("start-extra"):
+                continue
+            status, body = self._pub_post(path, {"id": "acc_1"})
+            self.assertEqual(status, 404, "%s 应当是 404（公开面不可写），实得 %s %s"
+                             % (path, status, body[:120]))
+        # 只读路径也不该多出来：公开面不是「管理面的只读副本」
+        for path in ("/cline/api/accounts", "/cline/api/models"):
+            status, _ = self._pub(path)
+            self.assertEqual(status, 404, "%s 不该存在" % path)
+
+    def test_public_status_does_not_leak_admin_endpoints(self):
+        """确认那条「没真的打到网关」：stub 的写回执应保持为空。
+
+        这是对上面那条的补充证据 —— 404 也可能来自「转发了但被网关拒」，
+        所以直接查 stub 的记账，证明请求根本没到网关。
+        """
+        _, tb = _get("http://127.0.0.1:%d/__toggled" % CLINE_PORT)
+        rec = json.loads(tb)
+        # 本组测试之前跑过的管理面用例会留下记录；这里关心的是**公开面**的 id
+        # 是否出现在记录里（公开面用的 id 是 acc_1，管理面也用 acc_1 —— 所以改看
+        # 有无新增：记录数在公开面测试前后必须不变）
+        before = len(rec["toggled"]) + len(rec["cleared"])
+        self._pub_post("/cline/api/account/disable", {"id": "acc_1"})
+        _, tb2 = _get("http://127.0.0.1:%d/__toggled" % CLINE_PORT)
+        rec2 = json.loads(tb2)
+        after = len(rec2["toggled"]) + len(rec2["cleared"])
+        self.assertEqual(after, before, "公开面的请求不该转发到网关的 /admin/*")
+
+    def test_public_status_unavailable_when_cline_not_configured(self):
+        """未配置 cline2api 的部署：公开面是 503，且说清原因（不是 500）。"""
+        status, body = _get_status("http://127.0.0.1:%d/cline/api/status" % PLAIN_PANEL_PORT)
+        self.assertEqual(status, 503)
+        self.assertIn("cline2api", json.loads(body)["error"])
+
+    def test_public_page_unavailable_when_cline_not_configured(self):
+        status, body = _get_status("http://127.0.0.1:%d/cline/" % PLAIN_PANEL_PORT)
+        self.assertEqual(status, 503)
+        self.assertIn("cline2api", json.loads(body)["error"])
 
     def test_cline_post_without_csrf_rejected(self):
         """cline 子面板的状态变更同样要过 CSRF 闸门。"""

@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -1266,8 +1266,64 @@ class Panel:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# cline2api 网关（第二上游：Cline 账号池，OpenAI 兼容）
+# 公开面：/cline/* —— 任何人可读的账号池状态 + 贡献账号
 # ──────────────────────────────────────────────────────────────────────
+#
+# 与 /api/cline/*（管理员面）的关系是**两条独立通路，不是同一接口的两种权限**：
+# 公开面自己向后端要数据、自己投影字段，管理员面一行都没改。这样公开面能做到
+# 只读且只暴露该暴露的，而管理面照旧全量 —— 也不需要给网关加「半权限令牌」。
+#
+# 两条硬边界（都由代码结构保证，不是靠记得别调错）：
+#   1. **只读**：公开面只发 GET 到网关，唯一的写操作是 POST /public/login/*（贡献账号）。
+#      账号与模型的启停、清冷却、复测全在 /admin/*，公开面连拼都拼不出来（白名单）。
+#   2. **不泄漏**：所有对外字段都经过下面的 _public_* 投影函数**逐个具名挑选**，
+#      不是「拿回来再删几个字段」。网关加字段不会自动流到公开面 —— 新字段默认不可见，
+#      这是唯一安全的默认方向。投影函数的单测就是这条红线的执行点。
+
+# 公开面允许出现的模型状态文案：只说「能不能用」，不说闸门内部状态名
+# （unverified / manual / disable_reason 这些是运营内部口径）。
+_PUBLIC_STATE = {
+    "free": "active", "exposed": "active",
+    "unverified": "checking", "disabled": "off",
+}
+
+
+def _public_model(m: dict) -> dict:
+    """公开面的模型条目：只有名字、分组、能不能用、有没有人在接。"""
+    return {
+        "name": m.get("bare") or m.get("upstream") or "",
+        "group": m.get("group") or "",
+        "state": _PUBLIC_STATE.get(m.get("state") or "", "unknown"),
+        "accounts": m.get("accounts_available") or 0,
+    }
+
+
+def _public_status(st: dict) -> dict:
+    """公开面的只读快照。字段是**白名单**，网关的新字段不会自动出现在这里。
+
+    刻意不含：账号邮箱/id（贡献者身份只归管理员）、上游模型名（含分区与线路）、
+    闸门台账的技术细节（last_cost / disable_reason / probe_streak）、
+    网关地址与 api_key（接入信息只归管理员）。
+    """
+    models = [_public_model(m) for m in (st.get("models") or []) if isinstance(m, dict)]
+    active = [m for m in models if m["state"] == "active"]
+    accounts = st.get("accounts") or []
+    return {
+        "version": st.get("version") or "",
+        "uptime_seconds": st.get("uptime_seconds") or 0,
+        "accounts_total": st.get("accounts_total") or 0,
+        "accounts_available": st.get("accounts_available") or 0,
+        "accounts_in_cooldown": sum(
+            1 for a in accounts
+            if isinstance(a, dict) and (a.get("status") or "active") != "active"),
+        "models_total": len(models),
+        "models_active": len(active),
+        "models": models,
+        "catalog_last_sync": (st.get("catalog") or {}).get("last_sync") or "",
+        # 目录同步失败对公开面有意义（模型列表可能是旧的），但错误原文是上游细节
+        "catalog_stale": bool((st.get("catalog") or {}).get("error")),
+    }
+
 
 class ClinePanel:
     """cline2api 的展示与操作入口。
@@ -1358,6 +1414,53 @@ class ClinePanel:
             return {"error": "cline2api %d: %s" % (code, str(res)[:160])}
         return {"ok": True, "started": True}
 
+    # — 公开面（未鉴权）————————————————————————————————————
+    #
+    # 这两个方法**只**服务 /cline/* 公开面：一个是只读投影，一个是贡献账号代理。
+    # 它们与管理面共用 _req()，所以网关地址与令牌只在一处 —— 公开面不额外持有凭据。
+
+    def public_status(self) -> dict:
+        """公开面的只读快照（已投影，可直接对外）。"""
+        code, st = self._req("GET", "/status", timeout=15)
+        if code != 200 or not isinstance(st, dict):
+            return {"error": "账号池状态暂时读不到（网关 %d）" % code}
+        return _public_status(st)
+
+    def public_contribute_start(self) -> tuple[dict, int]:
+        """发起一次贡献登录。返回 (响应体, HTTP 状态)。"""
+        code, res = self._req("POST", "/public/login/start", timeout=30)
+        if code == 404:
+            # 网关比面板旧：它还没有公开面。说清楚，别让用户以为是自己的问题。
+            return {"error": "本面板所连的网关版本不支持账号贡献，请先升级 cline2api。"}, 501
+        if code == 429:
+            wait = extract_error_message(res) or "稍后再试"
+            return {"error": wait, "retry_after": _retry_after_seconds(wait)}, 429
+        if code != 200:
+            return {"error": extract_error_message(res) or "发起贡献失败"}, 502
+        return (res if isinstance(res, dict) else {"error": "上游返回异常"}), 200
+
+    def public_contribute_poll(self, device_code: str) -> tuple[dict, int]:
+        code, res = self._req("GET", "/public/login/poll?device_code="
+                              + urllib.parse.quote(device_code, safe=""), timeout=15)
+        if code != 200 or not isinstance(res, dict):
+            return {"state": "error", "error": "登录状态查询失败"}, 502
+        return res, 200
+
+    def public_contribute_cancel(self, device_code: str) -> dict:
+        self._req("POST", "/public/login/cancel?device_code="
+                  + urllib.parse.quote(device_code, safe=""), timeout=15)
+        return {"ok": True}
+
+
+def _retry_after_seconds(msg: str) -> int:
+    """从网关的限流文案里抠出建议等待秒数（抠不到回 60）。
+
+    面板只是把网关那句「N 秒后再试」翻成秒数给前端做倒计时，不自己发明节流规则
+    —— 节流是网关的事，面板照抄它的判断。
+    """
+    m = re.search(r"(\d+)\s*秒", msg or "")
+    return int(m.group(1)) if m else 60
+
 
 # ──────────────────────────────────────────────────────────────────────
 # HTTP 服务
@@ -1428,6 +1531,55 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p.task_status(since))
         if path.startswith("/api/cline/"):
             return self._cline_get(path)
+        if path.startswith("/cline/"):
+            return self._public_get(path)
+        return self._send(404, {"error": "not found"})
+
+    # — 公开面 ————————————————————————————————————————————
+    #
+    # 路由与 /api/* 完全分开：公开面有自己的前缀，admin 面的路由一条不改。
+    # 每个分支都是**字面量匹配**而不是前缀转发 —— 网关里有什么、公开面能摸到什么，
+    # 看这几个 if 就数得清，不存在「拼个路径试试」的余地。
+
+    def _public_cline(self):
+        """公开面用的 cline 客户端；未配置时统一 503。"""
+        c, err = self._cline()
+        if c is None:
+            return None, err
+        return c, None
+
+    def _public_get(self, path: str):
+        c, err = self._public_cline()
+        if c is None:
+            return err
+        if path in ("/cline/", "/cline/index.html"):
+            page = HERE / "public.html"
+            if not page.is_file():
+                # 缺件（比如镜像漏拷）时说清楚缺的是哪个文件 —— 默认的
+                # FileNotFoundError 会变成 500，看不出该补什么。
+                return self._send(500, {"error": "面板缺 public.html（公开页文件），"
+                                                 "请重新部署 proxy-panel。"})
+            return self._send(200, page.read_text(encoding="utf-8"),
+                              "text/html; charset=utf-8")
+        if path == "/cline/api/status":
+            return self._send(200, c.public_status())
+        if path == "/cline/api/login/poll":
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            body, code = c.public_contribute_poll((q.get("device_code") or [""])[0])
+            return self._send(code, body)
+        return self._send(404, {"error": "not found"})
+
+    def _public_post(self, path: str, body: dict):
+        c, err = self._public_cline()
+        if c is None:
+            return err
+        if path == "/cline/api/login/start":
+            payload, code = c.public_contribute_start()
+            return self._send(code, payload)
+        if path == "/cline/api/login/cancel":
+            return self._send(200, c.public_contribute_cancel(body.get("device_code") or ""))
+        # 公开面没有其它写操作。「停用账号/关停模型」在这里**不存在对应分支**，
+        # 不是在别处被拒 —— 请求走到这里就是 404。
         return self._send(404, {"error": "not found"})
 
     def _cline(self):
@@ -1452,6 +1604,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        p = self.panel
+        body = self._body()
+
+        # 公开面在 CSRF 闸门**之前**分流，理由不是省事，而是它压根没有可被 CSRF 的东西：
+        # 它的写操作只有「发起一次账号捐赠」，任何人都能发起、也随时能取消，
+        # 借他人浏览器提交得到的只是「这个人自己发起了一次捐赠」——攻击者一无所获。
+        # 而带上自定义头会在跨站预检时被挡，等于把公开页面上的贡献按钮废掉。
+        # 反过来：管理员面（/api/*）的闸门一个字没动，仍要求 X-Panel-Request。
+        if path.startswith("/cline/"):
+            return self._public_post(path, body)
+
         # CSRF 闸门：状态变更接口只认带自定义头的请求。
         # 反向代理上的 Basic 认证凭据是浏览器自动附带的，跨站页面也能触发 POST
         # （表单 + sendBeacon 都不需要预检）；而自定义头会强制预检，被 CORS 挡下。
@@ -1459,9 +1623,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("X-Panel-Request") != "1":
             return self._send(403, {"error": "拒绝跨站请求：缺少 X-Panel-Request: 1 头。"
                                              "用脚本调用时请显式加上；浏览器里正常点击不受影响。"})
-        path = self.path.split("?", 1)[0]
-        p = self.panel
-        body = self._body()
 
         if path == "/api/login/start":
             realm = (body.get("realm") or "cn").strip().lower()
