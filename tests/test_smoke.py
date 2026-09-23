@@ -315,7 +315,7 @@ class TestClineSmoke(unittest.TestCase):
         status, body = self._api("/api/cline/status")
         self.assertEqual(status, 200)
         d = json.loads(body)
-        self.assertEqual(d["accounts_total"], 2)
+        self.assertEqual(d["accounts_total"], 3)
         exposed = [m["bare"] for m in d["models"] if m["exposed"]]
         self.assertEqual(exposed, ["glm-5.3-flash"])
 
@@ -415,17 +415,36 @@ class TestClineSmoke(unittest.TestCase):
         self.assertIn("Cline 免费额度池", body)
 
     def test_public_status_is_projected(self):
-        """公开状态可用，且**不含**邮箱、上游名、网关地址这些内部信息。"""
+        """公开状态可用，且**不含**上游名、账号 id、网关地址这些内部信息。"""
         status, body = self._pub("/cline/api/status")
         self.assertEqual(status, 200)
         d = json.loads(body)
-        self.assertEqual(d["accounts_total"], 2)
+        self.assertEqual(d["accounts_total"], 3)
+        self.assertEqual(d["accounts_available"], 2)
         self.assertEqual(d["models_active"], 1)
         self.assertEqual([m["name"] for m in d["models"]],
                          ["glm-5.3-flash", "claude-opus-5"])
-        for secret in ("abc***@gmail.com", "z-ai/glm-5.3-flash",
-                       "cline-free/deepseek-v4.1-flash", "acc_1", "127.0.0.1"):
+        for secret in ("z-ai/glm-5.3-flash", "cline-free/deepseek-v4.1-flash",
+                       "acc_1", "acc_2", "acc_3", "127.0.0.1",
+                       "requestsTotal", "tokensTotal"):
             self.assertNotIn(secret, body, "公开面泄漏了 %s" % secret)
+
+    def test_public_accounts_are_listed_but_masked(self):
+        """账号池下拉要有东西可显示，但邮箱只留打码后的前几位。
+
+        stub 里有一条 **gateway 没打码成功的短邮箱**（ab@x.com）—— 真实 /status
+        会这样漏出来，所以这条断言是「面板自己再挡一层」的证据。
+        """
+        _, body = self._pub("/cline/api/status")
+        accts = json.loads(body)["accounts"]
+        self.assertEqual(len(accts), 3)
+        names = [a["name"] for a in accts]
+        self.assertIn("abc***@gmail.com", names)
+        self.assertIn("ab***@x.com", names)        # 面板补打码
+        self.assertNotIn("ab@x.com", body)         # 完整地址不得出现
+        # 每条都带状态，前端才知道怎么标注
+        for a in accts:
+            self.assertIn(a["state"], ("active", "cooldown", "paused", "expired", "unknown"))
 
     def test_public_contribute_flow(self):
         """贡献链路：start 拿授权地址 → poll 报成功。"""

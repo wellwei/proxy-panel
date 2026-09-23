@@ -31,8 +31,8 @@ PUBLIC_DEVICE = "pub-dev-1"   # 公开面贡献会话的 device_code
 STATUS = {
     "version": "stub",
     "uptime_seconds": 120,
-    "accounts_total": 2,
-    "accounts_available": 1,
+    "accounts_total": 3,
+    "accounts_available": 2,
     "accounts": [
         {"accountId": "acc_1", "email": "abc***@gmail.com", "status": "active",
          "requestsTotal": 12, "requestsToday": 3, "tokensTotal": 4567,
@@ -46,6 +46,10 @@ STATUS = {
          "cooldownUntil": "2026-09-21T00:00:00Z",
          "requestsTotal": 5, "requestsToday": 1, "tokensTotal": 900,
          "createdAt": "2026-09-20T00:00:00Z"},
+        # 短邮箱：网关自己的 MaskEmail 在 local part 不足 3 字符时会**原样返回完整
+        # 地址**，所以真实 /status 里会出现这种未打码的形态 —— 公开面必须自己再挡一层。
+        {"accountId": "acc_3", "email": "ab@x.com", "status": "active",
+         "requestsTotal": 0, "tokensTotal": 0, "createdAt": "2026-09-22T00:00:00Z"},
     ],
     # accounts_available 是**逐模型**的可用账号数（额度按账号×模型计）：真实网关
     # 每条都带它，公开页据此区分「有账号能接」与「额度暂时用尽」。stub 少了它，

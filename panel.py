@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -1287,6 +1287,60 @@ _PUBLIC_STATE = {
     "unverified": "checking", "disabled": "off",
 }
 
+# 公开面的账号状态词表。manualDisabled 折进 "paused"：公开面不必区分
+# 「运维临时摘除」与「凭据失效」，只说这个账号现在能不能出力。
+_PUBLIC_ACCOUNT_STATE = {
+    "active": "active", "cooldown": "cooldown",
+    "expired": "expired", "disabled": "paused",
+}
+
+
+def _public_email(email: str) -> str:
+    """公开面显示的打码邮箱：最多留前 3 个字符，其余一律打掉。
+
+    网关自己也打码，但那是**管理员口径**，且有个会漏完整地址的兜底分支 ——
+    local part 不足 3 个字符时（`ab@x.com`、`a@b.co`）它整条原样返回。
+    管理面无所谓，公开面不行：所以这里独立再做一层，且更严。
+
+    幂等：网关已经打成 `abc***@gmail.com` 的，再走一遍还是它。
+    """
+    email = (email or "").strip()
+    if not email:
+        return "（无邮箱）"
+    local, sep, domain = email.partition("@")
+    # 网关可能已经把 local 打成 'abc***'，取它前面那段未打码的部分再截
+    visible = local.split("***")[0][:3]
+    if not sep or not domain:
+        return visible + "***" if visible else "***"
+    return "%s***@%s" % (visible, domain)
+
+
+def _public_account(a: dict) -> dict:
+    """公开面的账号条目：打码邮箱 + 现在能不能用 + 恢复时间。
+
+    刻意不含 accountId（公开面无法对它做任何操作，少一个标识少一分枚举面），
+    也不含请求数/token 量 —— 那些是运营口径。
+    """
+    status = a.get("status") or "active"
+    if a.get("manualDisabled"):
+        status = "disabled"
+    limits = [m for m in (a.get("modelCooldowns") or [])
+              if isinstance(m, dict) and _not_zero_time(m.get("until"))]
+    until = a.get("cooldownUntil") or ""
+    return {
+        "name": _public_email(a.get("email") or ""),
+        "state": _PUBLIC_ACCOUNT_STATE.get(status, "unknown"),
+        # 冷却截止时间只对冷却中的账号有意义，别的一律给空串（不给无用字段）
+        "until": until if status == "cooldown" and _not_zero_time(until) else "",
+        "limits": len(limits),
+    }
+
+
+def _not_zero_time(s) -> bool:
+    """Go 的零值时间是 0001-01-01T...，当「没有」处理（与前端 isZeroTime 同口径）。"""
+    s = str(s or "")
+    return bool(s) and not s.startswith("0001-01-01")
+
 
 def _public_model(m: dict) -> dict:
     """公开面的模型条目：只有名字、分组、能不能用、有没有人在接。"""
@@ -1301,21 +1355,23 @@ def _public_model(m: dict) -> dict:
 def _public_status(st: dict) -> dict:
     """公开面的只读快照。字段是**白名单**，网关的新字段不会自动出现在这里。
 
-    刻意不含：账号邮箱/id（贡献者身份只归管理员）、上游模型名（含分区与线路）、
-    闸门台账的技术细节（last_cost / disable_reason / probe_streak）、
-    网关地址与 api_key（接入信息只归管理员）。
+    刻意不含：**完整**邮箱与账号 id（邮箱只给打码后的前 3 个字符）、
+    上游模型名（含分区与线路）、闸门台账的技术细节（last_cost / disable_reason /
+    probe_streak）、邮箱的请求量统计、网关地址与 api_key（接入信息只归管理员）。
     """
     models = [_public_model(m) for m in (st.get("models") or []) if isinstance(m, dict)]
     active = [m for m in models if m["state"] == "active"]
-    accounts = st.get("accounts") or []
+    accounts = [_public_account(a) for a in (st.get("accounts") or []) if isinstance(a, dict)]
+    # 排稳定序：能出力的排前面，同组按打码名。不给公开面看池子的内部顺序。
+    rank = {"active": 0, "cooldown": 1, "paused": 2, "expired": 3}
+    accounts.sort(key=lambda a: (rank.get(a["state"], 9), a["name"]))
     return {
         "version": st.get("version") or "",
         "uptime_seconds": st.get("uptime_seconds") or 0,
         "accounts_total": st.get("accounts_total") or 0,
         "accounts_available": st.get("accounts_available") or 0,
-        "accounts_in_cooldown": sum(
-            1 for a in accounts
-            if isinstance(a, dict) and (a.get("status") or "active") != "active"),
+        "accounts_in_cooldown": sum(1 for a in accounts if a["state"] != "active"),
+        "accounts": accounts,
         "models_total": len(models),
         "models_active": len(active),
         "models": models,

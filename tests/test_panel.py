@@ -494,8 +494,11 @@ class TestPublicProjection(unittest.TestCase):
                                  "until": "2026-09-21T18:03:18Z",
                                  "reason": "SECRET-REASON"}]},
             {"accountId": "acc_2", "email": "def***@qq.com", "status": "cooldown",
+             "cooldownUntil": "2026-09-21T00:00:00Z",
              "lastReason": "429: Try again in 17h", "manualDisabled": True},
-            {"accountId": "acc_3", "email": "ghi***@qq.com", "status": "active"},
+            # 短邮箱：网关自己的打码在这个形状上会**原样返回完整地址**
+            # （MaskEmail 的兜底分支），是公开面最需要挡住的一种
+            {"accountId": "acc_3", "email": "ab@x.com", "status": "active"},
         ],
         "models": [
             {"upstream": "z-ai/glm-5.3-flash", "bare": "glm-5.3-flash", "group": "free",
@@ -520,21 +523,54 @@ class TestPublicProjection(unittest.TestCase):
         out = panel._public_status(self.RICH_STATUS)
         self.assertEqual(set(out), {
             "version", "uptime_seconds", "accounts_total", "accounts_available",
-            "accounts_in_cooldown", "models_total", "models_active", "models",
+            "accounts_in_cooldown", "accounts", "models_total", "models_active", "models",
             "catalog_last_sync", "catalog_stale",
         })
         for m in out["models"]:
             self.assertEqual(set(m), {"name", "group", "state", "accounts"})
+        for a in out["accounts"]:
+            self.assertEqual(set(a), {"name", "state", "until", "limits"})
 
     def test_no_sensitive_value_survives_projection(self):
-        """整份输出序列化后搜哨兵值 —— 比逐字段断言更能挡住「加了个新字段」的回归。"""
+        """整份输出序列化后搜哨兵值 —— 比逐字段断言更能挡住「加了个新字段」的回归。
+
+        注意：打码邮箱是**有意**出现在公开面的（账号池下拉要用它认领自己的账号），
+        所以这里搜的是**完整**地址与内部标识，不是「邮箱」这个词。
+        """
         blob = json.dumps(panel._public_status(self.RICH_STATUS), ensure_ascii=False)
         for secret in ("SECRET-RT", "SECRET-REASON", "SECRET-DISABLE",
                        "SECRET-CATALOG-ERR", "SECRET-API-KEY",
-                       "acc_1", "acc_2", "abc***@gmail.com",
+                       "acc_1", "acc_2", "acc_3",
+                       "ab@x.com",                     # 短邮箱：完整地址必须被挡住
                        "z-ai/glm-5.3-flash", "anthropic/claude-opus-5",
                        "127.0.0.1:7862"):
             self.assertNotIn(secret, blob, "公开面泄漏了 %s" % secret)
+
+    def test_accounts_are_listed_with_masked_emails(self):
+        """账号池下拉要有东西可显示：每个账号一条，邮箱是打码的。"""
+        out = panel._public_status(self.RICH_STATUS)
+        names = [a["name"] for a in out["accounts"]]
+        # 能出力的两个在前（组内按打码名排），停用的在后
+        self.assertEqual(names, ["ab***@x.com", "abc***@gmail.com", "def***@qq.com"])
+        # 认得出的部分留着，认不出的部分打掉
+        self.assertIn("abc***", names[1])
+        self.assertNotIn("ab@x.com", json.dumps(out))
+
+    def test_account_state_and_details(self):
+        out = panel._public_status(self.RICH_STATUS)
+        by = {a["name"]: a for a in out["accounts"]}
+        # 手动停用折进 paused（公开面不必区分「运维摘除」与「凭据失效」）
+        self.assertEqual(by["def***@qq.com"]["state"], "paused")
+        # 冷却截止时间只对冷却中的账号给；限额数量只数真的到期时间
+        self.assertEqual(by["abc***@gmail.com"]["limits"], 1)
+        self.assertEqual(by["abc***@gmail.com"]["until"], "")
+        self.assertEqual(by["ab***@x.com"]["limits"], 0)
+
+    def test_accounts_sorted_active_first(self):
+        """稳定排序：能出力的排前面，同组按打码名 —— 不暴露池子的内部顺序。"""
+        out = panel._public_status(self.RICH_STATUS)
+        self.assertEqual([a["state"] for a in out["accounts"]],
+                         ["active", "active", "paused"])
 
     def test_upstream_names_are_replaced_by_bare_names(self):
         """上游名带分区/线路信息，公开面只给裸名（与模型广场同一口径）。"""
@@ -559,15 +595,53 @@ class TestPublicProjection(unittest.TestCase):
     def test_empty_and_partial_payloads_do_not_crash(self):
         """网关字段缺失/为空时也要给出可渲染的结果（公开面不能 500）。"""
         for bad in ({}, {"models": None, "accounts": None}, {"models": [{}]},
-                    {"catalog": None}, {"accounts": ["not-a-dict"]}):
+                    {"catalog": None}, {"accounts": ["not-a-dict"]},
+                    {"accounts": [{"email": None}]}, {"accounts": [{}]}):
             out = panel._public_status(bad)      # 不抛异常即通过
             self.assertIn("models", out)
             self.assertIsInstance(out["models"], list)
+            self.assertIsInstance(out["accounts"], list)
 
     def test_unknown_state_is_not_passed_through(self):
         """认不出的状态一律 unknown —— 不把内部状态名原样端出去。"""
         out = panel._public_model({"bare": "x", "state": "some-internal-state"})
         self.assertEqual(out["state"], "unknown")
+
+
+class TestPublicEmailMasking(unittest.TestCase):
+    """公开面的邮箱打码：不超过 3 个字符，且**任何形状都不漏完整地址**。
+
+    这条独立于网关：网关自己也打码，但它的兜底分支在短邮箱上会原样返回整个地址
+    （`ab@x.com` / `a@b.co`）。管理面无所谓，公开面是硬要求。
+    """
+
+    def test_keeps_at_most_three_chars(self):
+        cases = {
+            "alice@example.com": "ali***@example.com",
+            "alice.bob@example.com": "ali***@example.com",
+            "ab@x.com": "ab***@x.com",
+            "a@b.co": "a***@b.co",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(panel._public_email(raw), want, raw)
+
+    def test_is_idempotent_on_already_masked(self):
+        """网关已经打过的再过一遍不变（面板不重复打码）。"""
+        for m in ("abc***@gmail.com", "ab***@x.com"):
+            self.assertEqual(panel._public_email(m), m)
+
+    def test_never_returns_the_whole_address(self):
+        """凡是带 @ 的，输出里必须出现 *** —— 完整地址绝不放行。"""
+        for raw in ("ab@x.com", "a@b.co", "ab@qq.com", "x@y.z", "aa@bb.cc"):
+            out = panel._public_email(raw)
+            self.assertIn("***", out, raw)
+            self.assertNotEqual(out, raw, raw)
+
+    def test_missing_or_odd_input_is_handled(self):
+        self.assertEqual(panel._public_email(""), "（无邮箱）")
+        self.assertEqual(panel._public_email(None), "（无邮箱）")
+        self.assertEqual(panel._public_email("no-at-sign"), "no-***")
+        self.assertEqual(panel._public_email("@" ), "***")
 
 
 class TestRetryAfterParsing(unittest.TestCase):
