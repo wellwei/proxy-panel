@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -36,7 +37,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PORT = 8321
@@ -794,6 +795,37 @@ def _release_lock(fd):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 滑动窗口限流器（公开面节流）
+# ──────────────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    """滑动窗口限流器：最小间隔 + 滚动窗口（默认 1 小时）内上限。"""
+
+    def __init__(self, limit_per_hour: int = 20, interval_seconds: int = 30):
+        self.limit = limit_per_hour
+        self.interval = interval_seconds
+        self.starts = []
+        self._lock = threading.Lock()
+
+    def allow(self, now: float = None) -> tuple[bool, int]:
+        if now is None:
+            now = time.time()
+        with self._lock:
+            cut = now - 3600
+            self.starts = [t for t in self.starts if t > cut]
+            if self.starts:
+                last = self.starts[-1]
+                wait = self.interval - (now - last)
+                if wait > 0:
+                    return False, int(math.ceil(wait))
+            if len(self.starts) >= self.limit:
+                wait = (self.starts[0] + 3600) - now
+                return False, int(math.ceil(wait))
+            self.starts.append(now)
+            return True, 0
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 面板业务逻辑
 # ──────────────────────────────────────────────────────────────────────
 
@@ -809,6 +841,15 @@ class Panel:
         # 任务作业：同一时刻只允许一个（重复点击 409）。job 是当前/最近一次。
         self._task_busy = threading.Lock()
         self.job: "TaskJob | None" = None
+
+        # WorkBuddy 公开贡献会话与限流
+        self.wb_cn_base = os.environ.get("WB_CN_BASE", "https://copilot.tencent.com")
+        self.wb_cn_origin = "https://www.codebuddy.cn"
+        self.wb_global_base = os.environ.get("WB_GLOBAL_BASE", "https://www.workbuddy.ai")
+        self.wb_global_origin = "https://www.workbuddy.ai"
+        self._wb_public_lock = threading.Lock()
+        self._wb_public_sessions = {}
+        self._wb_public_limiter = RateLimiter(limit_per_hour=20, interval_seconds=30)
 
     # — 网关转发 —————————————————————————————————————————
     def gateway(self, path: str, timeout=60):
@@ -980,49 +1021,56 @@ class Panel:
         每轮先核对 gen：取消或新开会话都会 +1，发现自己被取代就退出。否则被取消的
         线程会继续 poll，而新会话已覆写同一个 state 文件 —— 它会拿新会话的结果去落盘。
         """
-        deadline = time.time() + LOGIN_TIMEOUT
-        while time.time() < deadline:
-            time.sleep(3)
-            with self._lock:
-                if self.session.get("gen") != gen:
-                    return
-            rc, out, _ = self.run_login_cli(["--realm=%s" % realm, "poll"])
-            if rc != 0:
-                continue                    # 未完成：CLI 以非零退出
-            try:
-                payload = json.loads(out)
-            except ValueError:
-                continue
-            if not payload.get("access_token"):
-                continue
-            with self._lock:
-                if self.session.get("gen") != gen:
-                    return
-            try:
-                self._write_auth_file(payload)
-            except Exception as e:
+        try:
+            deadline = time.time() + LOGIN_TIMEOUT
+            while time.time() < deadline:
+                time.sleep(3)
                 with self._lock:
-                    if self.session.get("gen") == gen:
-                        self.session = {"gen": gen, "stage": "error",
-                                        "message": "写入凭据失败：%s" % e,
-                                        "url": url, "realm": realm}
-                return
-            extra = ""
-            if realm == "global":
-                extra = self._complete_global_region()
-            with self._lock:
-                if self.session.get("gen") != gen:
+                    if self.session.get("gen") != gen:
+                        return
+                rc, out, _ = self.run_login_cli(["--realm=%s" % realm, "poll"])
+                if rc != 0:
+                    continue                    # 未完成：CLI 以非零退出
+                try:
+                    payload = json.loads(out)
+                except ValueError:
+                    continue
+                if not payload.get("access_token"):
+                    continue
+                with self._lock:
+                    if self.session.get("gen") != gen:
+                        return
+                try:
+                    self._write_auth_file(payload)
+                except Exception as e:
+                    with self._lock:
+                        if self.session.get("gen") == gen:
+                            self.session = {"gen": gen, "stage": "error",
+                                            "message": "写入凭据失败：%s" % e,
+                                            "url": url, "realm": realm}
                     return
-                self.session = {"gen": gen, "stage": "done",
-                                "message": "已加入账号池：%s%s" % (
-                                    payload.get("nickname") or payload.get("uid"), extra),
-                                "url": url, "realm": realm}
-            return
-        with self._lock:
-            if self.session.get("gen") == gen:
-                self.session = {"gen": gen, "stage": "timeout",
-                                "message": "登录超时（%d 分钟），请重新发起" % (LOGIN_TIMEOUT // 60),
-                                "url": url, "realm": realm}
+                extra = ""
+                if realm == "global":
+                    extra = self._complete_global_region()
+                with self._lock:
+                    if self.session.get("gen") != gen:
+                        return
+                    self.session = {"gen": gen, "stage": "done",
+                                    "message": "已加入账号池：%s%s" % (
+                                        payload.get("nickname") or payload.get("uid"), extra),
+                                    "url": url, "realm": realm}
+                return
+            with self._lock:
+                if self.session.get("gen") == gen:
+                    self.session = {"gen": gen, "stage": "timeout",
+                                    "message": "登录超时（%d 分钟），请重新发起" % (LOGIN_TIMEOUT // 60),
+                                    "url": url, "realm": realm}
+        finally:
+            if self._login_busy.locked():
+                try:
+                    self._login_busy.release()
+                except RuntimeError:
+                    pass
 
     def _complete_global_region(self) -> str:
         """Global 账号需要完善注册地区，否则 chat 报 14017。"""
@@ -1079,6 +1127,175 @@ class Panel:
             # gen+1 让后台线程下一轮自行退出
             self.session = {"gen": self.session.get("gen", 0) + 1, "stage": "idle",
                             "message": "", "url": "", "realm": ""}
+
+    # — WorkBuddy 公开贡献面 ——————————————————————————————
+    def is_wb_uid_in_pool(self, uid: str) -> bool:
+        """检查 WorkBuddy 账号 uid 是否已在池中（磁盘凭据或网关内存）。"""
+        if not uid:
+            return False
+        if self.cfg.auth_dir:
+            target = self.cfg.auth_dir / ("workbuddy-%s.json" % uid)
+            if target.is_file():
+                return True
+        try:
+            code, st = self.gateway("/status", timeout=10)
+            if isinstance(st, dict):
+                for a in (st.get("accounts") or []):
+                    if a.get("uid") == uid:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def public_status(self) -> dict:
+        """WorkBuddy 公开面只读快照（脱敏投影）。"""
+        code, st = self.gateway("/status", timeout=15)
+        if not isinstance(st, dict) or st.get("error"):
+            return {"error": "WorkBuddy 账号池状态暂时读不到（网关 %s）" % (
+                st.get("error") if isinstance(st, dict) else code)}
+        try:
+            credits = self.credit_map()
+            if credits:
+                for a in (st.get("accounts") or []):
+                    c = credits.get(a.get("uid"))
+                    if c:
+                        a["credits"] = c.get("remain")
+                        a["credits_used"] = c.get("used")
+                        a["credits_size"] = c.get("size")
+        except Exception:
+            pass
+        models_raw = self.models()
+        return _public_wb_status(st, models_raw if isinstance(models_raw, dict) else {})
+
+    def wb_public_login_start(self, realm: str = "cn") -> tuple[dict, int]:
+        """发起一次 WorkBuddy 账号贡献登录（受节流保护）。"""
+        realm = (realm or "cn").strip().lower()
+        if realm not in ("cn", "global"):
+            return {"error": "realm 只能是 cn 或 global"}, 400
+        ok, wait = self._wb_public_limiter.allow()
+        if not ok:
+            return {"error": "%d 秒后再试，请求过于频繁" % wait, "retry_after": wait}, 429
+        base = self.wb_global_base if realm == "global" else self.wb_cn_base
+        origin = self.wb_global_origin if realm == "global" else self.wb_cn_origin
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": origin,
+            "Referer": origin + "/",
+            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+        }
+        code, res = http("POST", base + "/v2/plugin/auth/state?platform=CLI",
+                         body=b"{}", headers=headers, timeout=15)
+        if code != 200 or not isinstance(res, dict) or res.get("code") != 0:
+            return {"error": "发起授权失败，请稍后重试"}, 502
+        data = res.get("data") or {}
+        state = data.get("state")
+        auth_url = data.get("authUrl")
+        if not state or not auth_url:
+            return {"error": "上游未返回有效的授权地址"}, 502
+        now = time.time()
+        with self._wb_public_lock:
+            # 清理过期会话
+            self._wb_public_sessions = {s: v for s, v in self._wb_public_sessions.items()
+                                        if v.get("deadline", 0) > now}
+            self._wb_public_sessions[state] = {
+                "state": state, "realm": realm, "base": base, "origin": origin,
+                "url": auth_url, "created": now, "deadline": now + 300,
+            }
+        return {"ok": True, "state": state, "url": auth_url, "realm": realm}, 200
+
+    def wb_public_login_poll(self, state: str) -> tuple[dict, int]:
+        """轮询 WorkBuddy 公开贡献状态。"""
+        state = (state or "").strip()
+        if not state:
+            return {"state": "error", "error": "缺少 state 参数"}, 400
+        now = time.time()
+        with self._wb_public_lock:
+            sess = self._wb_public_sessions.get(state)
+        if not sess:
+            return {"state": "error", "error": "会话不存在或已过期，请重新发起"}, 200
+        if now > sess.get("deadline", 0):
+            with self._wb_public_lock:
+                self._wb_public_sessions.pop(state, None)
+            return {"state": "error", "error": "授权超时，请重新发起"}, 200
+
+        base = sess["base"]
+        origin = sess["origin"]
+        realm = sess["realm"]
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": origin,
+            "Referer": origin + "/",
+            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+        }
+        code, tok_res = http("GET", base + "/v2/plugin/auth/token?state=" + urllib.parse.quote(state, safe=""),
+                             headers=headers, timeout=15)
+        if code != 200 or not isinstance(tok_res, dict):
+            return {"state": "pending"}, 200
+        if tok_res.get("code") != 0:
+            return {"state": "pending"}, 200
+        tok_data = tok_res.get("data") or {}
+        access_token = tok_data.get("accessToken")
+        refresh_token = tok_data.get("refreshToken")
+        if not access_token or not refresh_token:
+            return {"state": "pending"}, 200
+
+        # 获取账号信息
+        acct_headers = dict(headers)
+        acct_headers["Authorization"] = "Bearer " + access_token
+        code_acct, acct_res = http("GET", base + "/v2/plugin/login/account?state=" + urllib.parse.quote(state, safe=""),
+                                   headers=acct_headers, timeout=15)
+        acct_data = (acct_res.get("data") or {}) if (code_acct == 200 and isinstance(acct_res, dict)) else {}
+        uid = acct_data.get("uid") or ""
+        nickname = acct_data.get("nickname") or ""
+        enterprise_id = acct_data.get("enterpriseId") or ""
+        if not uid:
+            return {"state": "error", "error": "获取账号信息失败，请重新发起"}, 200
+
+        # 去重检查：账号是否已在池中
+        if self.is_wb_uid_in_pool(uid):
+            with self._wb_public_lock:
+                self._wb_public_sessions.pop(state, None)
+            return {"state": "error", "error": "该账号已在池中，无需重复贡献"}, 200
+
+        if not self.cfg.auth_dir:
+            with self._wb_public_lock:
+                self._wb_public_sessions.pop(state, None)
+            return {"state": "error", "error": "未配置 auth_dir，无法保存凭据"}, 200
+
+        payload = {
+            "uid": uid,
+            "enterprise_id": enterprise_id,
+            "nickname": nickname,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": tok_data.get("expiresIn") or 2592000,
+            "domain": tok_data.get("domain") or "",
+            "realm": realm,
+        }
+        try:
+            self._write_auth_file(payload)
+        except Exception as e:
+            sys.stderr.write("[panel] write auth error: %s\n" % e)
+            with self._wb_public_lock:
+                self._wb_public_sessions.pop(state, None)
+            return {"state": "error", "error": "写入凭据失败，请联系管理员"}, 200
+
+        if realm == "global":
+            self._complete_global_region()
+
+        with self._wb_public_lock:
+            self._wb_public_sessions.pop(state, None)
+        return {"state": "done", "name": _public_wb_name(nickname, uid), "realm": realm}, 200
+
+    def wb_public_login_cancel(self, state: str) -> dict:
+        """取消 WorkBuddy 公开登录会话。"""
+        state = (state or "").strip()
+        with self._wb_public_lock:
+            self._wb_public_sessions.pop(state, None)
+        return {"ok": True}
 
     # — 一键任务（跑网关自带的 task_runner.py / school_open_day_2026.py）———
     #
@@ -1313,6 +1530,78 @@ def _public_email(email: str) -> str:
     if not sep or not domain:
         return visible + "***" if visible else "***"
     return "%s***@%s" % (visible, domain)
+
+
+def _public_wb_name(nickname: str, uid: str) -> str:
+    """公开面打码昵称/UID。"""
+    nickname = (nickname or "").strip()
+    if "@" in nickname:
+        return _public_email(nickname)
+    if nickname:
+        if len(nickname) == 1:
+            return nickname + "***"
+        if len(nickname) == 2:
+            return nickname[0] + "***"
+        return "%s***%s" % (nickname[0], nickname[-1])
+    uid = (uid or "").strip()
+    if len(uid) >= 8:
+        return "%s***%s" % (uid[:4], uid[-4:])
+    return uid[:3] + "***" if uid else "***"
+
+
+def _public_wb_account(a: dict) -> dict:
+    """公开面 WorkBuddy 账号条目。"""
+    uid = a.get("uid") or ""
+    nick = a.get("nickname") or ""
+    realm = a.get("realm") or "cn"
+    is_disabled = bool(a.get("disabled") or a.get("manual_disabled"))
+    is_cooling = bool(a.get("cooling") or (_not_zero_time(a.get("until")) and not is_disabled))
+    state = "paused" if is_disabled else ("cooldown" if is_cooling else "active")
+    until = a.get("until") or ""
+    return {
+        "name": _public_wb_name(nick, uid),
+        "realm": realm,
+        "state": state,
+        "credits": a.get("credits") or 0,
+        "credits_used": a.get("credits_used") or 0,
+        "until": until if state == "cooldown" and _not_zero_time(until) else "",
+    }
+
+
+def _public_wb_status(st: dict, models_raw: dict = None) -> dict:
+    """公开面 WorkBuddy 账号池只读快照。"""
+    raw_accts = [a for a in (st.get("accounts") or []) if isinstance(a, dict)]
+    accounts = [_public_wb_account(a) for a in raw_accts]
+    rank = {"active": 0, "cooldown": 1, "paused": 2}
+    accounts.sort(key=lambda a: (rank.get(a["state"], 9), 0 if a["realm"] == "cn" else 1, a["name"]))
+
+    models = []
+    if models_raw and isinstance(models_raw, dict):
+        by_realm = models_raw.get("models") or {}
+        for reg in ("cn", "global", "bare"):
+            for m in by_realm.get(reg, []):
+                models.append({
+                    "name": m,
+                    "realm": reg if reg in ("cn", "global") else "common",
+                    "state": "active",
+                })
+
+    active_count = sum(1 for a in accounts if a["state"] == "active")
+    cn_count = sum(1 for a in accounts if a["realm"] == "cn")
+    gl_count = sum(1 for a in accounts if a["realm"] == "global")
+    credits_total = sum((a.get("credits") or 0) for a in raw_accts)
+
+    return {
+        "accounts_total": len(accounts),
+        "accounts_available": active_count,
+        "accounts_cn": cn_count,
+        "accounts_global": gl_count,
+        "accounts_in_cooldown": sum(1 for a in accounts if a["state"] == "cooldown"),
+        "credits_total": credits_total,
+        "accounts": accounts,
+        "models_total": len(models),
+        "models": models,
+    }
 
 
 def _public_account(a: dict, today: str = "") -> dict:
@@ -1597,13 +1886,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p.task_status(since))
         if path.startswith("/api/cline/"):
             return self._cline_get(path)
-        if path.startswith("/cline/"):
+        if path.startswith("/cline/") or path.startswith("/contribute/"):
             return self._public_get(path)
+        if path in ("/cline", "/contribute"):
+            self.send_response(301)
+            self.send_header("Location", path + "/")
+            self.end_headers()
+            return
         return self._send(404, {"error": "not found"})
 
     # — 公开面 ————————————————————————————————————————————
     #
-    # 路由与 /api/* 完全分开：公开面有自己的前缀，admin 面的路由一条不改。
+    # 路由与 /api/* 完全分开：公开面有自己的前缀（/contribute/* 与兼容 /cline/*），
+    # admin 面的路由一条不改。
     # 每个分支都是**字面量匹配**而不是前缀转发 —— 网关里有什么、公开面能摸到什么，
     # 看这几个 if 就数得清，不存在「拼个路径试试」的余地。
 
@@ -1615,10 +1910,16 @@ class Handler(BaseHTTPRequestHandler):
         return c, None
 
     def _public_get(self, path: str):
-        c, err = self._public_cline()
-        if c is None:
-            return err
-        if path in ("/cline/", "/cline/index.html"):
+        p = self.panel
+        c = self.cline
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+
+        if path in ("/cline/", "/cline/index.html", "/contribute/", "/contribute/index.html"):
+            # 旧 /cline/* 路径在未配置 cline2api 时保持 503 兼容
+            if path.startswith("/cline/") and c is None:
+                return self._send(503, {"error": "面板未配置 cline2api（缺 base/admin_token）。"
+                                                 "用 --cline-config 指向它的 config.json，"
+                                                 "或设 CLINE2API_CONFIG 环境变量。"})
             page = HERE / "public.html"
             if not page.is_file():
                 # 缺件（比如镜像漏拷）时说清楚缺的是哪个文件 —— 默认的
@@ -1627,23 +1928,74 @@ class Handler(BaseHTTPRequestHandler):
                                                  "请重新部署 proxy-panel。"})
             return self._send(200, page.read_text(encoding="utf-8"),
                               "text/html; charset=utf-8")
-        if path == "/cline/api/status":
+
+        # 聚合状态
+        if path == "/contribute/api/status":
+            wb_st = p.public_status() if p else {}
+            c_st = c.public_status() if c else {}
+            return self._send(200, {"workbuddy": wb_st, "cline": c_st})
+
+        # 单独 WorkBuddy 状态
+        if path == "/contribute/api/workbuddy/status":
+            if not p:
+                return self._send(503, {"error": "面板未配置 workbuddy2api"})
+            return self._send(200, p.public_status())
+
+        # 单独 Cline 状态（包含旧 /cline/api/status 兼容）
+        if path in ("/contribute/api/cline/status", "/cline/api/status"):
+            if c is None:
+                return self._send(503, {"error": "面板未配置 cline2api（缺 base/admin_token）。"
+                                                 "用 --cline-config 指向它的 config.json，"
+                                                 "或设 CLINE2API_CONFIG 环境变量。"})
             return self._send(200, c.public_status())
-        if path == "/cline/api/login/poll":
-            q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+
+        # WorkBuddy 登录轮询
+        if path in ("/contribute/api/workbuddy/login/poll", "/cline/api/workbuddy/login/poll"):
+            if not p:
+                return self._send(503, {"error": "面板未配置 workbuddy2api"})
+            state = (q.get("state") or [""])[0]
+            body, code = p.wb_public_login_poll(state)
+            return self._send(code, body)
+
+        # Cline 登录轮询（包含旧 /cline/api/login/poll 兼容）
+        if path in ("/contribute/api/cline/login/poll", "/contribute/api/login/poll", "/cline/api/login/poll"):
+            if c is None:
+                return self._send(503, {"error": "面板未配置 cline2api"})
             body, code = c.public_contribute_poll((q.get("device_code") or [""])[0])
             return self._send(code, body)
+
         return self._send(404, {"error": "not found"})
 
     def _public_post(self, path: str, body: dict):
-        c, err = self._public_cline()
-        if c is None:
-            return err
-        if path == "/cline/api/login/start":
+        p = self.panel
+        c = self.cline
+
+        # WorkBuddy 登录发起与取消
+        if path in ("/contribute/api/workbuddy/login/start", "/cline/api/workbuddy/login/start"):
+            if not p:
+                return self._send(503, {"error": "面板未配置 workbuddy2api"})
+            realm = (body.get("realm") or "cn").strip().lower()
+            payload, code = p.wb_public_login_start(realm)
+            return self._send(code, payload)
+
+        if path in ("/contribute/api/workbuddy/login/cancel", "/cline/api/workbuddy/login/cancel"):
+            if not p:
+                return self._send(503, {"error": "面板未配置 workbuddy2api"})
+            state = (body.get("state") or "").strip()
+            return self._send(200, p.wb_public_login_cancel(state))
+
+        # Cline 登录发起与取消（包含旧 /cline/api/login/* 兼容）
+        if path in ("/contribute/api/cline/login/start", "/contribute/api/login/start", "/cline/api/login/start"):
+            if c is None:
+                return self._send(503, {"error": "面板未配置 cline2api"})
             payload, code = c.public_contribute_start()
             return self._send(code, payload)
-        if path == "/cline/api/login/cancel":
+
+        if path in ("/contribute/api/cline/login/cancel", "/contribute/api/login/cancel", "/cline/api/login/cancel"):
+            if c is None:
+                return self._send(503, {"error": "面板未配置 cline2api"})
             return self._send(200, c.public_contribute_cancel(body.get("device_code") or ""))
+
         # 公开面没有其它写操作。「停用账号/关停模型」在这里**不存在对应分支**，
         # 不是在别处被拒 —— 请求走到这里就是 404。
         return self._send(404, {"error": "not found"})
@@ -1679,7 +2031,7 @@ class Handler(BaseHTTPRequestHandler):
         # 借他人浏览器提交得到的只是「这个人自己发起了一次捐赠」——攻击者一无所获。
         # 而带上自定义头会在跨站预检时被挡，等于把公开页面上的贡献按钮废掉。
         # 反过来：管理员面（/api/*）的闸门一个字没动，仍要求 X-Panel-Request。
-        if path.startswith("/cline/"):
+        if path.startswith("/cline/") or path.startswith("/contribute/"):
             return self._public_post(path, body)
 
         # CSRF 闸门：状态变更接口只认带自定义头的请求。

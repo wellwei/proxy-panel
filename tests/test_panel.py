@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -689,6 +691,365 @@ class TestRetryAfterParsing(unittest.TestCase):
     def test_falls_back_when_no_number(self):
         self.assertEqual(panel._retry_after_seconds("稍后再试"), 60)
         self.assertEqual(panel._retry_after_seconds(""), 60)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# WorkBuddy 公开贡献面（0.6.0 新增）
+# ──────────────────────────────────────────────────────────────────────
+
+class _StubWbUpstream:
+    """模拟 WorkBuddy 授权上游（copilot.tencent.com / workbuddy.ai）。
+
+    面板对它是纯 HTTP 客户端，所以单测起一个真回环 HTTP 服务，
+    按 wb_public_login_* 调用顺序记账并回放响应。
+    """
+
+    def __init__(self, uid="wb-new-1", nickname="新贡献者", delay_polls=0):
+        self.uid = uid
+        self.nickname = nickname
+        self.delay_polls = delay_polls      # token 前 N 次回「未完成」，第 N+1 次才放行
+        self.poll_count = 0
+        self.calls = []
+        import http.server
+        upstream = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _send(self, code, payload):
+                body = json.dumps(payload, ensure_ascii=False).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                upstream.calls.append(("POST", self.path))
+                if self.path.startswith("/v2/plugin/auth/state"):
+                    return self._send(200, {"code": 0, "data": {
+                        "state": "st-1", "authUrl": "https://example.com/auth?state=st-1"}})
+                return self._send(404, {"code": 404})
+
+            def do_GET(self):
+                upstream.calls.append(("GET", self.path))
+                if self.path.startswith("/v2/plugin/auth/token"):
+                    upstream.poll_count += 1
+                    if upstream.poll_count <= upstream.delay_polls:
+                        return self._send(200, {"code": 1001, "data": {}})
+                    return self._send(200, {"code": 0, "data": {
+                        "accessToken": "AT-1", "refreshToken": "RT-1",
+                        "expiresIn": 3600, "domain": "www.codebuddy.cn"}})
+                if self.path.startswith("/v2/plugin/login/account"):
+                    return self._send(200, {"code": 0, "data": {
+                        "uid": upstream.uid, "nickname": upstream.nickname,
+                        "enterpriseId": ""}})
+                return self._send(404, {"code": 404})
+
+            def log_message(self, *a):
+                pass
+
+        from http.server import ThreadingHTTPServer
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class TestRateLimiter(unittest.TestCase):
+    """公开面节流：最小间隔 + 滚动窗口上限，两条都要生效。"""
+
+    def test_min_interval(self):
+        rl = panel.RateLimiter(limit_per_hour=100, interval_seconds=30)
+        ok, _ = rl.allow(now=1000.0)
+        self.assertTrue(ok)
+        ok, wait = rl.allow(now=1010.0)
+        self.assertFalse(ok)
+        self.assertEqual(wait, 20)
+        ok, _ = rl.allow(now=1031.0)
+        self.assertTrue(ok)
+
+    def test_hourly_cap(self):
+        rl = panel.RateLimiter(limit_per_hour=3, interval_seconds=0)
+        for i in range(3):
+            ok, _ = rl.allow(now=1000.0 + i)
+            self.assertTrue(ok)
+        ok, wait = rl.allow(now=1003.0)
+        self.assertFalse(ok)
+        self.assertGreater(wait, 3500)          # 最早那次要满一小时才放出来
+        ok, _ = rl.allow(now=4601.0)            # 一小时后窗口滑动，放行
+        self.assertTrue(ok)
+
+    def test_old_entries_expire(self):
+        rl = panel.RateLimiter(limit_per_hour=1, interval_seconds=0)
+        rl.allow(now=1000.0)
+        ok, _ = rl.allow(now=1001.0)
+        self.assertFalse(ok)
+        ok, _ = rl.allow(now=4601.0)
+        self.assertTrue(ok)
+
+
+class TestPublicWbProjection(unittest.TestCase):
+    """WorkBuddy 公开状态投影：与 cline 同一套纪律 —— 白名单 + 哨兵值搜身。"""
+
+    RICH = {
+        "accounts": [
+            {"uid": "cn-uid-1", "realm": "cn", "nickname": "张三",
+             "credits": 100, "disabled": False, "manual_disabled": False,
+             "cooling": False, "success_count": 9, "consecutive_fails": 0,
+             "in_flight": 1, "breaker_fails": 0},
+            {"uid": "gl-uid-9", "realm": "global", "nickname": "globaluser@mail.com",
+             "credits": 0, "disabled": False, "manual_disabled": False,
+             "cooling": True, "until": "2099-01-01T00:00:00Z",
+             "success_count": 0, "consecutive_fails": 0},
+            {"uid": "cn-uid-2", "realm": "cn", "nickname": "李四",
+             "credits": 5, "disabled": True, "manual_disabled": True,
+             "manual_reason": "SECRET-REASON", "cooling": False},
+        ],
+        "redis_mode": "SECRET-REDIS", "sticky_sessions": 3,
+    }
+    MODELS = {"models": {"cn": ["glm-5.3"], "global": ["gpt-6-astra"], "bare": []}}
+
+    def test_status_projection_is_an_exact_whitelist(self):
+        out = panel._public_wb_status(self.RICH, self.MODELS)
+        self.assertEqual(set(out), {
+            "accounts_total", "accounts_available", "accounts_cn", "accounts_global",
+            "accounts_in_cooldown", "credits_total", "accounts", "models_total", "models",
+        })
+        for a in out["accounts"]:
+            self.assertEqual(set(a), {"name", "realm", "state", "credits",
+                                      "credits_used", "until"})
+        for m in out["models"]:
+            self.assertEqual(set(m), {"name", "realm", "state"})
+
+    def test_no_sensitive_value_survives_projection(self):
+        blob = json.dumps(panel._public_wb_status(self.RICH, self.MODELS),
+                          ensure_ascii=False)
+        for secret in ("SECRET-REDIS", "SECRET-REASON", "cn-uid-1", "gl-uid-9",
+                       "globaluser@mail.com", "success_count", "sticky_sessions"):
+            self.assertNotIn(secret, blob, "公开面泄漏了 %s" % secret)
+
+    def test_counts_and_sorting(self):
+        out = panel._public_wb_status(self.RICH, self.MODELS)
+        self.assertEqual(out["accounts_total"], 3)
+        self.assertEqual(out["accounts_available"], 1)      # 只有 cn-uid-1
+        self.assertEqual(out["accounts_cn"], 2)
+        self.assertEqual(out["accounts_global"], 1)
+        self.assertEqual(out["accounts_in_cooldown"], 1)
+        self.assertEqual(out["credits_total"], 105)
+        self.assertEqual(out["models_total"], 2)
+        # active 在前、cooldown 次之、paused 最后
+        self.assertEqual([a["state"] for a in out["accounts"]],
+                         ["active", "cooldown", "paused"])
+
+    def test_cooldown_until_only_shown_when_cooling(self):
+        out = panel._public_wb_status(self.RICH, self.MODELS)
+        by = {a["name"]: a for a in out["accounts"]}
+        cooling = [a for a in out["accounts"] if a["state"] == "cooldown"][0]
+        self.assertTrue(cooling["until"].startswith("2099-"))
+        active = [a for a in out["accounts"] if a["state"] == "active"][0]
+        self.assertEqual(active["until"], "")
+
+    def test_empty_payload_does_not_crash(self):
+        for bad in ({}, {"accounts": None}, {"accounts": [{}]}, {"accounts": ["x"]}):
+            out = panel._public_wb_status(bad)
+            self.assertIsInstance(out["accounts"], list)
+
+
+class TestPublicWbNameMasking(unittest.TestCase):
+    """wb 公开面的昵称/UID 打码：能认出自己，认不出全名。"""
+
+    def test_email_nickname_uses_email_masking(self):
+        self.assertEqual(panel._public_wb_name("alice@example.com", "u1"),
+                         "ali***@example.com")
+
+    def test_plain_nickname_keeps_edges(self):
+        self.assertEqual(panel._public_wb_name("张三丰", "u1"), "张***丰")
+        self.assertEqual(panel._public_wb_name("李四", "u1"), "李***")
+        self.assertEqual(panel._public_wb_name("王", "u1"), "王***")
+
+    def test_falls_back_to_uid(self):
+        self.assertEqual(panel._public_wb_name("", "abcdef123456"), "abcd***3456")
+        self.assertEqual(panel._public_wb_name("", "short"), "sho***")
+        self.assertEqual(panel._public_wb_name("", ""), "***")
+
+
+class TestWbPublicLogin(unittest.TestCase):
+    """WorkBuddy 公开贡献：state 会话生命周期 + 去重 + 落盘。
+
+    全程打到 _StubWbUpstream，不碰真实上游；网关侧用 _panel() 的可写 auth_dir
+    观察落盘结果。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "auths").mkdir()
+        self.upstream = _StubWbUpstream()
+        self.old_cn = os.environ.get("WB_CN_BASE")
+        os.environ["WB_CN_BASE"] = "http://127.0.0.1:%d" % self.upstream.port
+
+    def tearDown(self):
+        self.upstream.stop()
+        if self.old_cn is None:
+            os.environ.pop("WB_CN_BASE", None)
+        else:
+            os.environ["WB_CN_BASE"] = self.old_cn
+        self.tmp.cleanup()
+
+    def _panel(self):
+        cfg = panel.Config("http://x", "k", str(self.root / "auths"), "", 8321)
+        return panel.Panel(cfg)
+
+    def test_start_returns_state_and_url(self):
+        p = self._panel()
+        body, code = p.wb_public_login_start("cn")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["state"], "st-1")
+        self.assertIn("state=st-1", body["url"])
+        self.assertEqual(body["realm"], "cn")
+
+    def test_bad_realm_rejected(self):
+        p = self._panel()
+        body, code = p.wb_public_login_start("mars")
+        self.assertEqual(code, 400)
+
+    def test_start_is_rate_limited(self):
+        p = self._panel()
+        p._wb_public_limiter = panel.RateLimiter(limit_per_hour=100, interval_seconds=3600)
+        body, code = p.wb_public_login_start("cn")
+        self.assertEqual(code, 200)
+        body, code = p.wb_public_login_start("cn")
+        self.assertEqual(code, 429)
+        self.assertIn("retry_after", body)
+
+    def test_poll_pending_then_done_and_writes_auth(self):
+        self.upstream.delay_polls = 1
+        p = self._panel()
+        p.wb_public_login_start("cn")
+        body, code = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "pending")
+        body, code = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "done")
+        self.assertEqual(body["name"], "新***者")
+        # 凭据已按网关格式落盘，uid 与昵称与上游给的一致
+        auth = json.loads((self.root / "auths" / "workbuddy-wb-new-1.json")
+                          .read_text(encoding="utf-8"))
+        self.assertEqual(auth["account"]["uid"], "wb-new-1")
+        self.assertEqual(auth["account"]["nickname"], "新贡献者")
+        self.assertEqual(auth["auth"]["accessToken"], "AT-1")
+        self.assertEqual(auth["auth"]["realm"], "cn")
+        # 会话已清除：再 poll 同 state 报「不存在」
+        body, _ = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "error")
+
+    def test_poll_unknown_state(self):
+        p = self._panel()
+        body, code = p.wb_public_login_poll("nope")
+        self.assertEqual(body["state"], "error")
+        self.assertIn("不存在", body["error"])
+
+    def test_poll_empty_state_is_400(self):
+        p = self._panel()
+        body, code = p.wb_public_login_poll("")
+        self.assertEqual(code, 400)
+
+    def test_duplicate_uid_rejected_by_disk_check(self):
+        # 磁盘里已有同 uid 凭据：disk 这一道就该挡住（网关内存是第二道）
+        (self.root / "auths" / "workbuddy-wb-new-1.json").write_text("{}", encoding="utf-8")
+        p = self._panel()
+        p.wb_public_login_start("cn")
+        body, _ = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "error")
+        self.assertIn("已在池中", body["error"])
+
+    def test_cancel_clears_session(self):
+        p = self._panel()
+        p.wb_public_login_start("cn")
+        p.wb_public_login_cancel("st-1")
+        body, _ = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "error")
+
+    def test_session_expires(self):
+        p = self._panel()
+        p.wb_public_login_start("cn")
+        with p._wb_public_lock:
+            p._wb_public_sessions["st-1"]["deadline"] = time.time() - 1
+        body, _ = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "error")
+        self.assertIn("超时", body["error"])
+
+    def test_done_name_is_masked(self):
+        """入池成功回给浏览器的名字必须是打码的 —— 不能原样回昵称。"""
+        self.upstream.nickname = "敏感全名ABC"
+        p = self._panel()
+        p.wb_public_login_start("cn")
+        body, _ = p.wb_public_login_poll("st-1")
+        self.assertEqual(body["state"], "done")
+        self.assertNotIn("敏感全名ABC", json.dumps(body, ensure_ascii=False))
+        self.assertIn("***", body["name"])
+
+
+class TestWbPublicUidInPool(unittest.TestCase):
+    """去重判定：磁盘凭据是第一道（离线也有效），网关内存是第二道。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "auths").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_disk_hit(self):
+        (self.root / "auths" / "workbuddy-u9.json").write_text("{}", encoding="utf-8")
+        cfg = panel.Config("http://x", "k", str(self.root / "auths"), "", 8321)
+        p = panel.Panel(cfg)
+        self.assertTrue(p.is_wb_uid_in_pool("u9"))
+        self.assertFalse(p.is_wb_uid_in_pool("other"))
+
+    def test_empty_uid_is_false(self):
+        cfg = panel.Config("http://x", "k", str(self.root / "auths"), "", 8321)
+        self.assertFalse(panel.Panel(cfg).is_wb_uid_in_pool(""))
+
+    def test_gateway_memory_is_fallback(self):
+        """磁盘没有但网关 /status 里有，也算在池中（刚热加载还没落盘的边界）。"""
+        import http.server
+        class H(http.server.BaseHTTPRequestHandler):
+            def _send(self, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                if self.path == "/status":
+                    return self._send({"accounts": [{"uid": "mem-1"}]})
+                return self._send({})
+            def log_message(self, *a):
+                pass
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg = panel.Config("http://127.0.0.1:%d" % srv.server_address[1],
+                               "k", str(self.root / "auths"), "", 8321)
+            p = panel.Panel(cfg)
+            self.assertTrue(p.is_wb_uid_in_pool("mem-1"))
+            self.assertFalse(p.is_wb_uid_in_pool("nobody"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_gateway_unreachable_falls_back_to_disk_only(self):
+        """网关挂了不能误判「不在池中」导致重复入池 —— 磁盘判定仍然有效。"""
+        (self.root / "auths" / "workbuddy-u9.json").write_text("{}", encoding="utf-8")
+        cfg = panel.Config("http://127.0.0.1:1", "k", str(self.root / "auths"), "", 8321)
+        p = panel.Panel(cfg)
+        self.assertTrue(p.is_wb_uid_in_pool("u9"))       # 磁盘命中
+        self.assertFalse(p.is_wb_uid_in_pool("other"))   # 网关不通 → False（保守放行）
 
 
 if __name__ == "__main__":

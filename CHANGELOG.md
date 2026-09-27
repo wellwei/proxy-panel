@@ -2,6 +2,42 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] — 2026-09-27
+
+公开面从「Cline 单池」扩成「WorkBuddy + Cline 双池合并页」，路由前缀换成
+`/contribute/*`（旧 `/cline/*` 保留兼容）。WorkBuddy 账号从此也能在公开页自助入池。
+
+### 新增
+
+- **WorkBuddy 公开贡献**：面板代发起官方插件授权流（`copilot.tencent.com` /
+  `workbuddy.ai` 的 `/v2/plugin/auth/*`），轮询拿到 token 后按网关格式原子落盘到
+  `auths/`，网关热加载即入池。支持选注册地区（国内版/国际版）。
+- **去重两道**：先查磁盘凭据（`workbuddy-<uid>.json`），再查网关 `/status` 内存态，
+  同一个 uid 只能入池一次，重复贡献在轮询完成时被拒。
+- **公开面节流**：面板侧滑动窗口限流（默认最小间隔 30 秒、每小时 20 次），
+  超限回 429 并带 `retry_after`。
+- **合并公开页** `/contribute/`：顶部两池汇总，按池分节列账号与模型。
+  WorkBuddy 账号条目是打码昵称 + 注册地区 + 剩余积分 + 状态；
+  聚合状态 `/contribute/api/status` 一次轮询拿全两池。
+
+### 兼容
+
+- `/cline/*` 全部旧路由原样保留（页面与 `/cline/api/*`），行为与 0.5.x 一致；
+  新链接一律用 `/contribute/`。
+- Caddy 侧需补 `handle /contribute/*`（与 `/cline/*` 同一形态，见仓库
+  `new-api/deploy/Caddyfile`）；`verify-caddy-routing.py` 已加对应断言。
+
+### 测试
+
+- 新增 24 项单测：wb 投影白名单与哨兵扫描、昵称/UID 打码、限流器（最小间隔 +
+  滚动窗口）、登录会话生命周期（pending→done→落盘→会话清除）、两道去重、
+  会话过期与取消、落盘名打码。
+- 新增 10 项冒烟：`/contribute` 页面与重定向、聚合状态、wb 状态投影、
+  wb 贡献链路与错误形状、合并面写操作 404、去重端到端（stub 网关 `--auth-dir`
+  把预放凭据并进 `/status`，磁盘 + 内存两道判定都在场）。
+- Caddy 路由验证新增 8 项断言（`/contribute` 重定向、合并页可达、聚合状态、
+  wb 投影、合并面写操作 404）。面板单测 86 项、冒烟 71 项、Caddy 验证 66 项全通过。
+
 ## [0.5.2] — 2026-09-23
 
 公开页补上两张信息：每个账号**今天用了多少 token**，以及**这份数据是什么时候刷新的**。

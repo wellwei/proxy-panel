@@ -412,7 +412,7 @@ class TestClineSmoke(unittest.TestCase):
     def test_public_page_is_served_without_credentials(self):
         status, body = self._pub("/cline/")
         self.assertEqual(status, 200)
-        self.assertIn("Cline 免费额度池", body)
+        self.assertIn("免费额度池", body)
         # 页面会自己轮询，读者得知道眼前这份数字是什么时候的
         self.assertIn('id="fresh"', body)
         self.assertIn("每 30 秒自动刷新", body)
@@ -634,6 +634,194 @@ class TestClineSmoke(unittest.TestCase):
         self.assertEqual(models["glm-5.3-flash"]["last_cost"], 0)
         self.assertEqual(models["claude-opus-5"]["last_cost"], 65)
         self.assertIn("credits", models["claude-opus-5"]["disable_reason"])
+
+    # ── 公开面 /contribute/*（WorkBuddy + Cline 合并页，0.6.0 起）────────────
+    #
+    # 合并页把两个池子装进同一页：路由从 /cline/* 扩到 /contribute/*（旧路径保留
+    # 兼容）。这组测试守三件事：合并页本身可达、wb 贡献链路完整、边界没扩。
+
+    def test_contribute_page_is_served(self):
+        status, body = self._pub("/contribute/")
+        self.assertEqual(status, 200)
+        self.assertIn("免费额度池", body)
+        self.assertIn('id="fresh"', body)
+        # 两个池子的容器与两个贡献入口都在
+        for marker in ('id="wbBody"', 'id="clBody"', 'id="wbGoBtn"', 'id="clGoBtn"',
+                       'id="wbm"', 'id="m"'):
+            self.assertIn(marker, body, marker)
+
+    def test_contribute_redirects_to_trailing_slash(self):
+        """无尾斜杠补斜杠（面板自己 301，不依赖 Caddy —— Caddy 那道在
+        verify-caddy-routing.py 里另有断言）。"""
+        import urllib.error
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            opener.open("http://127.0.0.1:%d/contribute" % CLINE_PANEL_PORT, timeout=10)
+            self.fail("应返回 301")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 301)
+            self.assertTrue(e.headers.get("Location", "").endswith("/contribute/"))
+
+    def test_contribute_aggregate_status(self):
+        """聚合状态把两个池子装进一个响应：前端一次轮询拿全。"""
+        status, body = self._pub("/contribute/api/status")
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["workbuddy"]["accounts_total"], 3)
+        self.assertEqual(d["cline"]["accounts_total"], 3)
+        # wb 侧投影同样不含内部标识
+        wb_blob = json.dumps(d["workbuddy"], ensure_ascii=False)
+        for secret in ("cn-uid-1", "gl-uid-1", "manual_reason", "success_count"):
+            self.assertNotIn(secret, wb_blob, secret)
+
+    def test_contribute_wb_status_projected(self):
+        status, body = self._pub("/contribute/api/workbuddy/status")
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["accounts_total"], 3)
+        self.assertEqual(d["accounts_available"], 1)     # stub 里只有 cn-uid-1
+        self.assertEqual(d["accounts_cn"], 2)
+        self.assertEqual(d["accounts_global"], 1)
+        self.assertEqual(d["credits_total"], 150)
+        names = [a["name"] for a in d["accounts"]]
+        # 打码名：CN 一号 → C***号，Global 一号 → G***号
+        self.assertIn("C***号", names)
+        self.assertIn("G***号", names)
+        self.assertNotIn("CN 一号", body)
+        # 模型按区域摊平
+        self.assertEqual({m["realm"] for m in d["models"]}, {"cn", "global"})
+
+    def test_contribute_wb_login_start_and_poll(self):
+        """wb 贡献链路：start 拿 state → poll 报 pending（真实授权完不成）→ cancel。"""
+        status, body = self._pub_post("/contribute/api/workbuddy/login/start",
+                                      {"realm": "cn"})
+        # stub 网关不是真上游：面板向 copilot.tencent.com 发起 state 会失败，
+        # 但失败必须是「可读的 502」，不是 500 —— 这条守住错误路径的形状。
+        self.assertIn(status, (200, 502))
+        d = json.loads(body)
+        if status == 200:
+            self.assertIn("state", d)
+            self.assertIn("url", d)
+            # cancel 清理会话
+            status, body = self._pub_post("/contribute/api/workbuddy/login/cancel",
+                                          {"state": d["state"]})
+            self.assertEqual(status, 200)
+        else:
+            self.assertIn("error", d)
+
+    def test_contribute_wb_login_bad_realm(self):
+        status, body = self._pub_post("/contribute/api/workbuddy/login/start",
+                                      {"realm": "mars"})
+        self.assertEqual(status, 400)
+
+    def test_contribute_wb_login_poll_requires_state(self):
+        status, body = self._pub("/contribute/api/workbuddy/login/poll")
+        self.assertEqual(status, 400)
+
+    def test_contribute_cline_routes_still_work(self):
+        """合并页下 cline 贡献走 /contribute/api/cline/*（与旧 /cline/api/* 同效）。"""
+        status, body = self._pub_post("/contribute/api/cline/login/start", {})
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["device_code"], "pub-dev-1")
+        status, body = self._pub("/contribute/api/cline/login/poll?device_code=pub-dev-1")
+        self.assertEqual(json.loads(body)["state"], "done")
+
+    def test_contribute_surface_has_no_write_operations(self):
+        """合并公开面同样**没有任何**启停账号/模型的路径。"""
+        for path in ("/contribute/api/account/disable",
+                     "/contribute/api/model/disable",
+                     "/contribute/api/workbuddy/account/disable",
+                     "/contribute/api/cline/account/disable",
+                     "/contribute/api/recheck"):
+            status, _ = self._pub_post(path, {"id": "acc_1"})
+            self.assertEqual(status, 404, "%s 应当是 404" % path)
+        # 管理面接口在公开前缀下也不可达
+        status, _ = self._pub("/contribute/api/cline/status/admin")
+        self.assertEqual(status, 404)
+
+
+CONTRIB_GW_PORT = 7905       # 贡献去重冒烟：独立一套，stub 网关挂可写 auth-dir
+CONTRIB_PANEL_PORT = 8405
+
+
+class TestContributeDedupSmoke(unittest.TestCase):
+    """wb 贡献去重的端到端：auth 目录里已有的账号，公开贡献要拒掉。
+
+    单测里覆盖的是 disk 判定函数；这里走完整 HTTP 通路（stub 网关 --auth-dir
+    把预放凭据并进 /status，面板 disk + 网关内存两道去重都在场），证明装配起来
+    后「重复贡献同 uid」真的会被挡。
+    """
+
+    gw: subprocess.Popen = None
+    panel: subprocess.Popen = None
+    app: Path = None
+
+    @classmethod
+    def setUpClass(cls):
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        cls.app = Path(tempfile.mkdtemp(prefix="wb2a-contrib-"))
+        auths = cls.app / "auths"
+        auths.mkdir()
+        # 预放一个「已在池中」的账号凭据（形状与 _write_auth_file 输出一致）
+        (auths / "workbuddy-cn-uid-1.json").write_text(json.dumps({
+            "account": {"uid": "cn-uid-1", "enterpriseId": "", "nickname": "CN 一号"},
+            "auth": {"accessToken": "at", "refreshToken": "rt",
+                     "expiresAt": 1, "domain": "", "realm": "cn"},
+        }), encoding="utf-8")
+
+        cls.gw = subprocess.Popen(
+            [sys.executable, str(ROOT / "tests" / "stub_gateway.py"),
+             "--port", str(CONTRIB_GW_PORT), "--auth-dir", str(auths)],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait_http("http://127.0.0.1:%d/status" % CONTRIB_GW_PORT):
+            cls.gw.terminate()
+            raise unittest.SkipTest("stub 网关未能启动")
+
+        cls.panel = subprocess.Popen(
+            [sys.executable, str(ROOT / "panel.py"),
+             "--base", "http://127.0.0.1:%d" % CONTRIB_GW_PORT,
+             "--key", "testkey", "--port", str(CONTRIB_PANEL_PORT),
+             "--gateway-config", "/nonexistent/gateway/config.json",
+             "--auth-dir", str(auths)],
+            cwd=str(ROOT), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if not _wait_http("http://127.0.0.1:%d/" % CONTRIB_PANEL_PORT):
+            cls.panel.terminate()
+            cls.gw.terminate()
+            raise unittest.SkipTest("面板未能启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        _stop(cls.panel, cls.gw)
+        if cls.app:
+            shutil.rmtree(cls.app, ignore_errors=True)
+
+    def test_auth_dir_account_appears_in_public_status(self):
+        """预放的凭据经 stub 热加载进 /status，公开状态里看得到（打码名）。"""
+        status, body = _get_status(
+            "http://127.0.0.1:%d/contribute/api/workbuddy/status" % CONTRIB_PANEL_PORT)
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["accounts_total"], 3)      # stub 固定 3 条里已含 cn-uid-1
+        names = [a["name"] for a in d["accounts"]]
+        self.assertIn("C***号", names)
+
+    def test_uid_in_pool_check_is_live(self):
+        """面板自己的去重判定对预放 uid 命中（disk 那道）。"""
+        sys.path.insert(0, str(ROOT))
+        from panel import Config, Panel
+        cfg = Config("http://127.0.0.1:%d" % CONTRIB_GW_PORT, "testkey",
+                     str(self.app / "auths"), "", CONTRIB_PANEL_PORT)
+        p = Panel(cfg)
+        self.assertTrue(p.is_wb_uid_in_pool("cn-uid-1"))   # disk 命中
+        self.assertTrue(p.is_wb_uid_in_pool("gl-uid-1"))   # 网关内存命中
+        self.assertFalse(p.is_wb_uid_in_pool("nobody"))
 
 
 TASK_GW_PORT = 7904        # 任务中心冒烟自带 stub 网关 + 假脚本目录
