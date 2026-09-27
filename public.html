@@ -129,8 +129,6 @@ button.primary:hover:not(:disabled){filter:brightness(1.08);color:var(--accent-f
         <summary>展开查看全部 <span id="wbAcctCount">…</span> 个账号</summary>
         <div id="wbAcctList"></div>
       </details>
-      <h3 style="margin:16px 0 8px;font-size:13.5px">可用模型</h3>
-      <div class="grid" id="wbModels"></div>
     </div>
   </div>
 
@@ -268,9 +266,6 @@ async function api(path, opts) {
   } catch (e) { return {status: 0, data: {error: String(e)}}; }
 }
 
-const STATE_TAG = {
-  active: ['可用', 'ok'], checking: ['观察中', 'warn'], off: ['已停用', ''], unknown: ['未知', 'warn'],
-};
 // 账号状态：与后台同一套语义，但文案是给别人看的
 const ACCT_TAG = {
   active: ['可用', 'ok'], cooldown: ['冷却中', 'warn'],
@@ -326,15 +321,6 @@ function renderWb(st) {
       ${extra ? `<span class="extra">${esc(extra)}</span>` : ''}
     </div>`;
   }).join('') : '<div class="acct"><span class="extra">账号池是空的。</span></div>';
-
-  const models = st.models || [];
-  $('wbModels').innerHTML = models.length ? models.map(m => {
-    const realm = m.realm === 'cn' ? '国内版' : (m.realm === 'global' ? '国际版' : '通用');
-    return `<div class="model">
-      <span class="nm">${esc(m.name)}</span>
-      <span class="tag ok">${realm}</span>
-    </div>`;
-  }).join('') : '<div class="empty">暂时读不到模型清单。</div>';
 }
 
 function renderCline(st) {
@@ -359,19 +345,21 @@ function renderCline(st) {
     </div>`;
   }).join('') : '<div class="acct"><span class="extra">账号池是空的。</span></div>';
 
-  const models = st.models || [];
+  // 只列「现在确实能调」的模型：已停用/未知状态的不进公开面（读者关心的是
+  // 现在能用什么，不是池子理论上挂过什么）。「额度用尽」是 active 但没有
+  // 可用账号，单独成一档，不算停用。
+  const models = (st.models || []).filter(m => m.state === 'active');
   $('clModels').innerHTML = models.length ? models.map(m => {
     // 「额度用尽」要单独成一档：闸门放行了它，但眼下没有账号能接。
     // 写成「可用（额度用尽）」自相矛盾 —— 用户读到的第一眼是「可用」，
     // 而它现在其实调不通。
-    const exhausted = m.state === 'active' && !m.accounts;
-    const [label, cls] = exhausted ? ['额度用尽', 'warn']
-      : (STATE_TAG[m.state] || [m.state, '']);
+    const exhausted = !m.accounts;
+    const [label, cls] = exhausted ? ['额度用尽', 'warn'] : ['可用', 'ok'];
     return `<div class="model">
       <span class="nm">${esc(m.name)}</span>
       <span class="tag ${cls}">${esc(label)}</span>
     </div>`;
-  }).join('') : '<div class="empty">暂时读不到模型清单。</div>';
+  }).join('') : '<div class="empty">暂时没有可用模型。</div>';
 
   if (st.catalog_stale) {
     $('clModels').insertAdjacentHTML('beforeend',
